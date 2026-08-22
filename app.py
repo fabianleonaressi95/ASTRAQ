@@ -1,18 +1,31 @@
+import json
 import os
+from datetime import datetime, timedelta, timezone
 
-import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from astra_q_ssa import (
-    VERSION,
-    export_results,
-    run_ssa,
-)
+try:
+    from sgp4.api import Satrec, jday
+except ImportError:
+    st.error("Manca il pacchetto sgp4. Controlla requirements.txt.")
+    st.stop()
 
 
 # ============================================================
-# CONFIG
+# ASTRA-Q SSA
+# Streamlit application
+# ============================================================
+
+APP_VERSION = "ASTRA-Q SSA v8.6"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "data", "stations_omm.json")
+
+
+# ============================================================
+# PAGE
 # ============================================================
 
 st.set_page_config(
@@ -23,7 +36,7 @@ st.set_page_config(
 
 
 # ============================================================
-# STYLE
+# CSS
 # ============================================================
 
 st.markdown(
@@ -31,21 +44,37 @@ st.markdown(
     <style>
 
     .main-title {
-        font-size: 42px;
-        font-weight: 800;
-        margin-bottom: 0;
+        font-size: 38px;
+        font-weight: 700;
+        margin-bottom: 0px;
     }
 
     .subtitle {
-        font-size: 18px;
+        font-size: 17px;
         opacity: 0.75;
-        margin-bottom: 30px;
+        margin-bottom: 25px;
     }
 
-    .status {
-        padding: 12px;
-        border-radius: 8px;
-        margin-bottom: 20px;
+    .metric-card {
+        padding: 18px;
+        border-radius: 12px;
+        border: 1px solid rgba(128,128,128,0.25);
+        text-align: center;
+    }
+
+    .risk-critical {
+        color: #ff3333;
+        font-weight: 700;
+    }
+
+    .risk-high {
+        color: #ff9900;
+        font-weight: 700;
+    }
+
+    .risk-low {
+        color: #33aa66;
+        font-weight: 700;
     }
 
     </style>
@@ -59,221 +88,506 @@ st.markdown(
 # ============================================================
 
 st.markdown(
-    '<div class="main-title">🛰️ ASTRA-Q SSA</div>',
+    '<div class="main-title">ASTRA-Q SSA</div>',
     unsafe_allow_html=True,
 )
 
 st.markdown(
     '<div class="subtitle">'
-    "Space Situational Awareness & Orbital Intelligence Platform"
+    "Space Situational Awareness & Orbital Intelligence"
     "</div>",
     unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# SIDEBAR
+# LOAD LOCAL OMM
 # ============================================================
 
-st.sidebar.title("ASTRA-Q CONTROL")
+@st.cache_data
+def load_catalog():
 
-max_objects = st.sidebar.slider(
-    "Maximum objects",
-    5,
-    40,
-    22,
-)
+    if not os.path.exists(DATA_FILE):
+        raise FileNotFoundError(
+            f"Missing local catalog: {DATA_FILE}"
+        )
 
-horizon = st.sidebar.selectbox(
-    "Propagation horizon",
-    [6, 12, 24, 48],
-    index=2,
-)
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        payload = json.load(f)
 
-step = st.sidebar.selectbox(
-    "Propagation step",
-    [1, 5, 10],
-    index=1,
-)
+    if isinstance(payload, dict) and "objects" in payload:
+        records = payload["objects"]
+        metadata = payload
+    elif isinstance(payload, list):
+        records = payload
+        metadata = {}
+    else:
+        raise ValueError("Invalid stations_omm.json format")
 
-screening = st.sidebar.number_input(
-    "Screening distance [km]",
-    min_value=10.0,
-    max_value=500.0,
-    value=50.0,
-)
+    valid = []
 
-threshold = st.sidebar.number_input(
-    "Conjunction threshold [km]",
-    min_value=1.0,
-    max_value=100.0,
-    value=25.0,
-)
+    for r in records:
 
-run_button = st.sidebar.button(
-    "🚀 RUN SSA ANALYSIS",
-    type="primary",
-    use_container_width=True,
-)
+        if not isinstance(r, dict):
+            continue
+
+        if "NORAD_CAT_ID" not in r:
+            continue
+
+        valid.append(r)
+
+    return valid, metadata
 
 
 # ============================================================
-# SESSION
+# BUILD SGP4
 # ============================================================
 
-if "results" not in st.session_state:
+def build_satrec(record):
 
-    st.session_state.results = None
+    # OMM JSON from CelesTrak
+    sat = Satrec()
+
+    sat.sgp4init(
+        72,
+        float(record["CLASSIFICATION"]),
+        float(record["NORAD_CAT_ID"]),
+        float(record["ELEMENT_SET_NO"]),
+        float(record["EPOCH"]),
+        float(record["MEAN_MOTION_DOT"]),
+        float(record["MEAN_MOTION_DDOT"]),
+        float(record["BSTAR"]),
+        int(record["EPHEMERIS_TYPE"]),
+        int(record["ELSET_NUM"]),
+        float(record["INCLINATION"]),
+        float(record["RA_OF_ASC_NODE"]),
+        float(record["ECCENTRICITY"]),
+        float(record["ARG_OF_PERICENTER"]),
+        float(record["MEAN_ANOMALY"]),
+        float(record["MEAN_MOTION"]),
+        int(record["REV_AT_EPOCH"]),
+    )
+
+    return sat
 
 
 # ============================================================
-# RUN
+# SAFE OMM CONVERSION
 # ============================================================
 
-if run_button:
+def make_satellite(record):
 
-    with st.spinner(
-        "Running ASTRA-Q orbital intelligence engine..."
-    ):
+    try:
+        sat = Satrec()
 
-        try:
-
-            results = run_ssa(
-                max_objects=max_objects,
-                horizon_hours=horizon,
-                step_minutes=step,
-                screening_distance_km=screening,
-                conjunction_threshold_km=threshold,
+        # Prefer Satrec.twoline2rv if raw TLE exists
+        if "TLE_LINE1" in record and "TLE_LINE2" in record:
+            sat = Satrec.twoline2rv(
+                record["TLE_LINE1"],
+                record["TLE_LINE2"]
             )
+            return sat
 
-            st.session_state.results = results
+        # OMM fields
+        sat.sgp4init(
+            72,
+            str(record.get("CLASSIFICATION", "U"))[0],
+            int(record["NORAD_CAT_ID"]),
+            float(record["EPOCH"]),
+            float(record["MEAN_MOTION_DOT"]),
+            float(record["MEAN_MOTION_DDOT"]),
+            float(record["BSTAR"]),
+            int(record.get("EPHEMERIS_TYPE", 0)),
+            int(record.get("ELEMENT_SET_NO", 0)),
+            np.deg2rad(float(record["INCLINATION"])),
+            np.deg2rad(float(record["RA_OF_ASC_NODE"])),
+            float(record["ECCENTRICITY"]),
+            np.deg2rad(float(record["ARG_OF_PERICENTER"])),
+            np.deg2rad(float(record["MEAN_ANOMALY"])),
+            float(record["MEAN_MOTION"]) * 2.0 * np.pi / 1440.0,
+            int(record["REV_AT_EPOCH"]),
+        )
 
-            export_results(
-                results
-            )
+        return sat
 
-            st.success(
-                "ASTRA-Q SSA analysis completed."
-            )
-
-        except Exception as exc:
-
-            st.error(
-                "SSA execution failed."
-            )
-
-            st.exception(exc)
+    except Exception:
+        return None
 
 
 # ============================================================
-# NO RESULT
+# PROPAGATION
 # ============================================================
 
-if st.session_state.results is None:
+def propagate_satellite(sat, start, hours=24, step_min=10):
+
+    n = int(hours * 60 / step_min) + 1
+
+    times = [
+        start + timedelta(minutes=i * step_min)
+        for i in range(n)
+    ]
+
+    positions = []
+    velocities = []
+
+    for t in times:
+
+        jd, fr = jday(
+            t.year,
+            t.month,
+            t.day,
+            t.hour,
+            t.minute,
+            t.second + t.microsecond / 1e6,
+        )
+
+        error, r, v = sat.sgp4(jd, fr)
+
+        if error != 0:
+            positions.append([np.nan, np.nan, np.nan])
+            velocities.append([np.nan, np.nan, np.nan])
+        else:
+            positions.append(r)
+            velocities.append(v)
+
+    return np.asarray(positions), np.asarray(velocities), times
+
+
+# ============================================================
+# LOAD
+# ============================================================
+
+try:
+
+    records, metadata = load_catalog()
+
+except Exception as e:
+
+    st.error("Catalogo locale non disponibile.")
+
+    st.code(str(e))
 
     st.info(
-        """
-        ### ASTRA-Q SSA READY
-
-        Press **RUN SSA ANALYSIS** to start the orbital
-        intelligence pipeline.
-
-        The engine will:
-
-        1. acquire orbital data
-        2. validate the catalog
-        3. construct SGP4 objects
-        4. propagate the constellation
-        5. detect co-located objects
-        6. screen conjunctions
-        7. refine TCA
-        8. calculate demonstration risk
-        9. detect orbital anomalies
-        10. execute structural audit
-        """
+        "Inserisci data/stations_omm.json nel repository GitHub "
+        "e riavvia l'app."
     )
 
     st.stop()
 
 
 # ============================================================
-# RESULTS
+# SIDEBAR
 # ============================================================
 
-r = st.session_state.results
+st.sidebar.header("ASTRA-Q CONTROL")
 
-summary = r["summary"]
+horizon = st.sidebar.slider(
+    "Propagation horizon (hours)",
+    1,
+    48,
+    24,
+)
+
+step = st.sidebar.selectbox(
+    "Propagation step (minutes)",
+    [5, 10, 15, 30],
+    index=0,
+)
+
+threshold = st.sidebar.slider(
+    "Conjunction threshold (km)",
+    1.0,
+    100.0,
+    25.0,
+)
+
+max_objects = st.sidebar.slider(
+    "Maximum objects",
+    2,
+    min(40, len(records)),
+    min(22, len(records)),
+)
+
+
+# ============================================================
+# CATALOG TABLE
+# ============================================================
+
+st.sidebar.markdown("---")
+
+st.sidebar.metric(
+    "LOCAL OMM OBJECTS",
+    len(records)
+)
+
+st.sidebar.caption(
+    "Catalog is loaded from GitHub/local repository."
+)
+
+if metadata.get("downloaded_utc"):
+    st.sidebar.caption(
+        "Catalog timestamp: "
+        + str(metadata["downloaded_utc"])
+    )
+
+
+# ============================================================
+# SELECT OBJECTS
+# ============================================================
+
+records = records[:max_objects]
+
+
+# ============================================================
+# PROPAGATE
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def run_propagation(records_json, horizon, step):
+
+    records_local = json.loads(records_json)
+
+    output = []
+
+    for idx, rec in enumerate(records_local):
+
+        sat = make_satellite(rec)
+
+        if sat is None:
+            continue
+
+        start = datetime.now(timezone.utc)
+
+        pos, vel, times = propagate_satellite(
+            sat,
+            start,
+            hours=horizon,
+            step_min=step,
+        )
+
+        for k, t in enumerate(times):
+
+            output.append({
+                "object_index": idx,
+                "name": rec.get(
+                    "OBJECT_NAME",
+                    rec.get("OBJECT_ID", f"OBJECT-{idx}")
+                ),
+                "norad_id": int(rec["NORAD_CAT_ID"]),
+                "time": t,
+                "x_km": pos[k, 0],
+                "y_km": pos[k, 1],
+                "z_km": pos[k, 2],
+                "vx_km_s": vel[k, 0],
+                "vy_km_s": vel[k, 1],
+                "vz_km_s": vel[k, 2],
+            })
+
+    return pd.DataFrame(output)
+
+
+records_json = json.dumps(
+    records,
+    sort_keys=True,
+    default=str,
+)
+
+
+with st.spinner("Propagating orbital states..."):
+
+    states = run_propagation(
+        records_json,
+        horizon,
+        step,
+    )
+
+
+# ============================================================
+# STATE VALIDATION
+# ============================================================
+
+if states.empty:
+
+    st.error(
+        "Nessun oggetto è stato propagato correttamente."
+    )
+
+    st.stop()
+
+
+states["altitude_km"] = (
+    np.sqrt(
+        states["x_km"] ** 2
+        + states["y_km"] ** 2
+        + states["z_km"] ** 2
+    )
+    - 6378.137
+)
+
+states["speed_km_s"] = np.sqrt(
+    states["vx_km_s"] ** 2
+    + states["vy_km_s"] ** 2
+    + states["vz_km_s"] ** 2
+)
+
+
+# ============================================================
+# OBJECT SUMMARY
+# ============================================================
+
+summary = (
+    states
+    .groupby(["object_index", "name", "norad_id"])
+    .agg(
+        altitude_min_km=("altitude_km", "min"),
+        altitude_max_km=("altitude_km", "max"),
+        altitude_mean_km=("altitude_km", "mean"),
+        speed_mean_km_s=("speed_km_s", "mean"),
+        state_rows=("altitude_km", "count"),
+    )
+    .reset_index()
+)
+
+
+# ============================================================
+# PAIR SCREENING
+# ============================================================
+
+def pair_screening(states_df, threshold_km):
+
+    pairs = []
+
+    grouped = {
+        k: g.sort_values("time").reset_index(drop=True)
+        for k, g in states_df.groupby("object_index")
+    }
+
+    object_ids = sorted(grouped.keys())
+
+    for i in range(len(object_ids)):
+
+        for j in range(i + 1, len(object_ids)):
+
+            a = grouped[object_ids[i]]
+            b = grouped[object_ids[j]]
+
+            n = min(len(a), len(b))
+
+            if n == 0:
+                continue
+
+            dr = (
+                a[
+                    ["x_km", "y_km", "z_km"]
+                ].values[:n]
+                -
+                b[
+                    ["x_km", "y_km", "z_km"]
+                ].values[:n]
+            )
+
+            distance = np.linalg.norm(dr, axis=1)
+
+            k = int(np.nanargmin(distance))
+
+            dmin = float(distance[k])
+
+            pairs.append({
+                "object_a": a.iloc[0]["name"],
+                "object_b": b.iloc[0]["name"],
+                "object_index_a": int(object_ids[i]),
+                "object_index_b": int(object_ids[j]),
+                "min_distance_km": dmin,
+                "time": a.iloc[k]["time"],
+                "candidate": dmin <= threshold_km,
+            })
+
+    return pd.DataFrame(pairs)
+
+
+pairs = pair_screening(
+    states,
+    threshold,
+)
+
+
+# ============================================================
+# DASHBOARD METRICS
+# ============================================================
+
+n_objects = len(summary)
+n_states = len(states)
+n_pairs = len(pairs)
+
+candidates = (
+    int(pairs["candidate"].sum())
+    if not pairs.empty
+    else 0
+)
+
+min_distance = (
+    float(pairs["min_distance_km"].min())
+    if not pairs.empty
+    else np.nan
+)
+
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+c1.metric(
+    "Objects",
+    n_objects,
+)
+
+c2.metric(
+    "State rows",
+    n_states,
+)
+
+c3.metric(
+    "Pairs",
+    n_pairs,
+)
+
+c4.metric(
+    "Candidates",
+    candidates,
+)
+
+c5.metric(
+    "Minimum distance",
+    "—" if np.isnan(min_distance)
+    else f"{min_distance:.2f} km",
+)
 
 
 # ============================================================
 # STATUS
 # ============================================================
 
-source = summary["source"]
-
-if source == "LIVE_CELESTRAK":
+if candidates == 0:
 
     st.success(
-        "● LIVE CATALOG — CelesTrak"
+        "NO CONJUNCTION CANDIDATES BELOW THRESHOLD"
     )
 
 else:
 
     st.warning(
-        "● CACHE MODE — CelesTrak unavailable"
+        f"{candidates} conjunction candidate(s) detected"
     )
-
-
-# ============================================================
-# KPIs
-# ============================================================
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-
-c1.metric(
-    "Objects",
-    summary["objects"]
-)
-
-c2.metric(
-    "State rows",
-    summary["state_rows"]
-)
-
-c3.metric(
-    "Pairs",
-    summary["possible_pairs"]
-)
-
-c4.metric(
-    "Coarse candidates",
-    summary["coarse_candidates"]
-)
-
-c5.metric(
-    "True conjunctions",
-    summary["true_conjunctions"]
-)
-
-c6.metric(
-    "Audit",
-    "PASS"
-    if summary["audit_pass"]
-    else "FAIL"
-)
 
 
 # ============================================================
 # TABS
 # ============================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4 = st.tabs(
     [
-        "🛰️ ORBITAL OBJECTS",
+        "🛰️ OBJECTS",
         "⚠️ CONJUNCTIONS",
-        "📊 RISK",
-        "🔬 ANOMALIES",
-        "🧪 AUDIT",
+        "📈 ORBITS",
+        "🔍 AUDIT",
     ]
 )
 
@@ -284,74 +598,13 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 
 with tab1:
 
-    st.subheader(
-        "Orbital State Engine"
-    )
+    st.subheader("Orbital State Engine")
 
     st.dataframe(
-        r["state_summary"],
+        summary,
         use_container_width=True,
         hide_index=True,
     )
-
-    states = r["states"]
-
-    if not states.empty:
-
-        st.subheader(
-            "Altitude evolution"
-        )
-
-        fig, ax = plt.subplots(
-            figsize=(12, 5)
-        )
-
-        for name, g in states.groupby(
-            "name"
-        ):
-
-            g = g.sort_values(
-                "grid_index"
-            )
-
-            altitude = (
-                (
-                    g[
-                        [
-                            "x_km",
-                            "y_km",
-                            "z_km",
-                        ]
-                    ]
-                    ** 2
-                ).sum(axis=1)
-                ** 0.5
-                - 6378.137
-            )
-
-            ax.plot(
-                range(len(g)),
-                altitude,
-                label=name,
-                alpha=0.55,
-            )
-
-        ax.set_xlabel(
-            "Propagation step"
-        )
-
-        ax.set_ylabel(
-            "Altitude [km]"
-        )
-
-        ax.grid(
-            alpha=0.25
-        )
-
-        st.pyplot(
-            fig,
-            clear_figure=True
-        )
 
 
 # ============================================================
@@ -360,197 +613,136 @@ with tab1:
 
 with tab2:
 
-    st.subheader(
-        "Conjunction Detection"
-    )
+    st.subheader("Conjunction Screening")
 
-    refined = r["refined"]
+    if pairs.empty:
 
-    if refined.empty:
-
-        st.success(
-            "No conjunction candidates after refinement."
-        )
+        st.info("No pairs available.")
 
     else:
 
-        display = refined[
-            [
-                "object_a",
-                "object_b",
-                "miss_distance_km",
-                "relative_velocity_km_s",
-                "tca_utc",
-                "tca_optimizer_success",
-            ]
-        ].copy()
-
-        st.dataframe(
-            display,
-            use_container_width=True,
-            hide_index=True,
+        candidates_df = pairs[
+            pairs["candidate"]
+        ].sort_values(
+            "min_distance_km"
         )
 
-        true_events = r[
-            "true_conjunctions"
-        ]
-
-        if not true_events.empty:
-
-            st.error(
-                f"{len(true_events)} "
-                "event(s) below conjunction threshold."
-            )
-
-            st.dataframe(
-                true_events,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-# ============================================================
-# RISK
-# ============================================================
-
-with tab3:
-
-    st.subheader(
-        "Demonstration Risk Engine"
-    )
-
-    st.warning(
-        """
-        IMPORTANT: risk scores and Monte Carlo envelopes
-        are demonstration outputs only.
-
-        ASTRA-Q does NOT calculate operational collision
-        probability Pc.
-        """
-    )
-
-    risk = r["risk"]
-
-    if risk.empty:
-
-        st.info(
-            "No true conjunction events."
-        )
-
-    else:
-
-        st.dataframe(
-            risk[
-                [
-                    "object_a",
-                    "object_b",
-                    "miss_distance_km",
-                    "mc_p05_km",
-                    "mc_median_km",
-                    "mc_p95_km",
-                    "risk_score_demo",
-                    "risk_level",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# ============================================================
-# ANOMALIES
-# ============================================================
-
-with tab4:
-
-    st.subheader(
-        "Orbital Anomaly Engine"
-    )
-
-    anomalies = r["anomalies"]
-
-    if anomalies.empty:
-
-        st.info(
-            "No anomaly data."
-        )
-
-    else:
-
-        anomaly_count = int(
-            anomalies[
-                "anomalous"
-            ].sum()
-        )
-
-        if anomaly_count == 0:
+        if candidates_df.empty:
 
             st.success(
-                "No anomalous orbital samples detected."
+                "No candidates below threshold."
             )
 
         else:
 
-            st.warning(
-                f"{anomaly_count} anomalous samples detected."
+            st.dataframe(
+                candidates_df,
+                use_container_width=True,
+                hide_index=True,
             )
 
-        st.dataframe(
-            anomalies.sort_values(
-                "anomaly_index",
-                ascending=False
-            ).head(100),
-            use_container_width=True,
-            hide_index=True,
-        )
+            st.markdown(
+                """
+                **Risk model status**
+
+                Operational collision probability (**Pc**) is
+                **not calculated**.
+
+                This dashboard performs geometric conjunction
+                screening only.
+                """
+            )
+
+
+# ============================================================
+# ORBITAL VISUALIZATION
+# ============================================================
+
+with tab3:
+
+    st.subheader("Altitude Evolution")
+
+    chart_df = states[
+        ["time", "name", "altitude_km"]
+    ].pivot(
+        index="time",
+        columns="name",
+        values="altitude_km",
+    )
+
+    st.line_chart(
+        chart_df,
+        height=500,
+    )
 
 
 # ============================================================
 # AUDIT
 # ============================================================
 
-with tab5:
+with tab4:
 
-    st.subheader(
-        "SSA Structural Audit"
+    st.subheader("ASTRA-Q Structural Audit")
+
+    expected_rows = (
+        n_objects
+        * (int(horizon * 60 / step) + 1)
     )
 
-    audit = r["audit"]
+    actual_rows = len(states)
 
-    audit_rows = []
+    audit = {
+        "version": APP_VERSION,
+        "catalog_local": True,
+        "catalog_objects": len(records),
+        "objects_propagated": n_objects,
+        "states_expected": expected_rows,
+        "states_actual": actual_rows,
+        "states_nonzero": actual_rows > 0,
+        "state_schema_valid": all(
+            c in states.columns
+            for c in [
+                "x_km",
+                "y_km",
+                "z_km",
+                "vx_km_s",
+                "vy_km_s",
+                "vz_km_s",
+            ]
+        ),
+        "finite_positions": bool(
+            np.isfinite(
+                states[
+                    ["x_km", "y_km", "z_km"]
+                ].values
+            ).all()
+        ),
+        "finite_velocities": bool(
+            np.isfinite(
+                states[
+                    ["vx_km_s", "vy_km_s", "vz_km_s"]
+                ].values
+            ).all()
+        ),
+        "pair_count": n_pairs,
+        "conjunction_candidates": candidates,
+        "operational_pc": False,
+        "risk_model": "GEOMETRIC_SCREENING_ONLY",
+    }
 
-    for key, value in audit.items():
+    audit["FINAL_SSA_AUDIT_PASS"] = all([
+        audit["catalog_objects"] > 0,
+        audit["objects_propagated"] > 0,
+        audit["states_nonzero"],
+        audit["state_schema_valid"],
+        audit["states_actual"] == audit["states_expected"],
+        audit["finite_positions"],
+        audit["finite_velocities"],
+    ])
 
-        if isinstance(value, bool):
+    st.json(audit)
 
-            status = (
-                "PASS"
-                if value
-                else "FAIL"
-            )
-
-        else:
-
-            status = str(value)
-
-        audit_rows.append(
-            {
-                "Check": key,
-                "Result": status,
-            }
-        )
-
-    audit_df = pd.DataFrame(
-        audit_rows
-    )
-
-    st.dataframe(
-        audit_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    if r["audit_pass"]:
+    if audit["FINAL_SSA_AUDIT_PASS"]:
 
         st.success(
             "FINAL SSA AUDIT PASS"
@@ -564,65 +756,14 @@ with tab5:
 
 
 # ============================================================
-# DOWNLOADS
-# ============================================================
-
-st.divider()
-
-st.subheader(
-    "Generated ASTRA-Q Data"
-)
-
-generated_dir = "data/generated"
-
-if os.path.exists(generated_dir):
-
-    files = sorted(
-        os.listdir(
-            generated_dir
-        )
-    )
-
-    cols = st.columns(
-        min(4, max(1, len(files)))
-    )
-
-    for i, filename in enumerate(files):
-
-        path = os.path.join(
-            generated_dir,
-            filename
-        )
-
-        with open(
-            path,
-            "rb"
-        ) as f:
-
-            data = f.read()
-
-        cols[
-            i % len(cols)
-        ].download_button(
-            filename,
-            data=data,
-            file_name=filename,
-            key=f"download_{filename}",
-        )
-
-
-# ============================================================
 # FOOTER
 # ============================================================
 
-st.divider()
+st.markdown("---")
 
 st.caption(
-    f"ASTRA-Q SSA v{VERSION} | "
-    "SGP4 Orbital Intelligence Demonstrator"
-)
-
-st.caption(
-    "Operational collision probability Pc is not calculated. "
-    "Risk outputs are demonstration-only."
+    f"{APP_VERSION} | "
+    "Local OMM catalog | "
+    "SGP4 propagation | "
+    "Geometric conjunction screening"
 )
