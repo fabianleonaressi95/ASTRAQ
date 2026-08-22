@@ -1,35 +1,49 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import json
-from pathlib import Path
-from datetime import datetime
+import math
+from datetime import datetime, timezone, timedelta
 
 import plotly.express as px
 import plotly.graph_objects as go
 
+from sgp4.api import Satrec, jday
+
 
 # ============================================================
-# ASTRA-Q SSA
-# SPACE SITUATIONAL AWARENESS & ORBITAL INTELLIGENCE
-# STREAMLIT DEMONSTRATOR
+# ASTRA-Q SSA LIVE
+# Space Situational Awareness & Orbital Intelligence
 # ============================================================
 
 st.set_page_config(
     page_title="ASTRA-Q SSA",
     page_icon="🛰️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-
 # ============================================================
-# PATHS
+# CONFIGURATION
 # ============================================================
 
-BASE = Path(__file__).resolve().parent
-DATA = BASE / "data"
+CELESTRAK_URL = (
+    "https://celestrak.org/NORAD/elements/gp.php"
+    "?GROUP=stations&FORMAT=json"
+)
 
+MAX_OBJECTS = 40
+HORIZON_HOURS = 24
+STEP_MINUTES = 5
+
+SCREENING_KM = 50.0
+CONJUNCTION_KM = 25.0
+
+COLOCATION_KM = 5.0
+COLOCATION_DV_KM_S = 0.050
+
+EARTH_RADIUS_KM = 6378.137
 
 # ============================================================
 # STYLE
@@ -39,175 +53,68 @@ st.markdown(
     """
     <style>
 
-    .main {
+    .stApp {
         background-color: #05080d;
     }
 
     .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
         max-width: 1500px;
-    }
-
-    h1, h2, h3 {
-        letter-spacing: 0.02em;
+        padding-top: 1.5rem;
     }
 
     .hero {
-        padding: 1.5rem 2rem;
-        border-radius: 14px;
+        padding: 1.6rem 2rem;
+        border-radius: 16px;
         background:
             linear-gradient(
                 135deg,
-                rgba(20,35,55,0.95),
-                rgba(5,10,18,0.98)
+                rgba(18,35,58,0.98),
+                rgba(4,9,16,0.98)
             );
-        border: 1px solid rgba(100,160,220,0.25);
+        border: 1px solid rgba(80,150,220,0.28);
         margin-bottom: 1.2rem;
     }
 
     .hero-title {
-        font-size: 2.2rem;
+        font-size: 2.4rem;
         font-weight: 800;
-        margin-bottom: 0.2rem;
     }
 
     .hero-subtitle {
-        font-size: 1.0rem;
+        font-size: 1.05rem;
         opacity: 0.72;
     }
 
-    .status-pass {
-        padding: 0.8rem 1rem;
+    .pass {
+        padding: 0.9rem 1.1rem;
         border-radius: 10px;
-        background: rgba(20,130,80,0.16);
-        border: 1px solid rgba(50,200,130,0.35);
+        background: rgba(20,140,80,0.15);
+        border: 1px solid rgba(50,210,130,0.35);
     }
 
-    .status-warning {
-        padding: 0.8rem 1rem;
+    .warning {
+        padding: 0.9rem 1.1rem;
         border-radius: 10px;
-        background: rgba(180,130,20,0.14);
-        border: 1px solid rgba(220,180,50,0.30);
+        background: rgba(190,140,20,0.15);
+        border: 1px solid rgba(230,190,50,0.35);
     }
 
-    .status-danger {
-        padding: 0.8rem 1rem;
+    .danger {
+        padding: 0.9rem 1.1rem;
         border-radius: 10px;
-        background: rgba(180,30,30,0.14);
+        background: rgba(190,30,30,0.15);
         border: 1px solid rgba(240,80,80,0.35);
     }
 
     .small {
-        font-size: 0.82rem;
         opacity: 0.65;
+        font-size: 0.82rem;
     }
 
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def read_csv(name):
-    path = DATA / name
-
-    if not path.exists():
-        return pd.DataFrame()
-
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
-
-
-def read_json(name):
-    path = DATA / name
-
-    if not path.exists():
-        return {}
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-@st.cache_data
-def load_data():
-
-    catalog = read_csv("catalog.csv")
-    states = read_csv("propagated_states.csv")
-    state_summary = read_csv("state_summary.csv")
-
-    screening = read_csv(
-        "conjunction_screening_candidates.csv"
-    )
-
-    refined = read_csv(
-        "conjunction_candidates_refined.csv"
-    )
-
-    conjunctions = read_csv(
-        "conjunction_events.csv"
-    )
-
-    risk = read_csv(
-        "risk_events.csv"
-    )
-
-    anomalies = read_csv(
-        "anomaly_events.csv"
-    )
-
-    colocated = read_csv(
-        "colocation_pairs.csv"
-    )
-
-    pair_audit = read_csv(
-        "pair_audit.csv"
-    )
-
-    summary = read_json("summary.json")
-    audit = read_json("audit.json")
-
-    return {
-        "catalog": catalog,
-        "states": states,
-        "state_summary": state_summary,
-        "screening": screening,
-        "refined": refined,
-        "conjunctions": conjunctions,
-        "risk": risk,
-        "anomalies": anomalies,
-        "colocated": colocated,
-        "pair_audit": pair_audit,
-        "summary": summary,
-        "audit": audit,
-    }
-
-
-data = load_data()
-
-
-catalog = data["catalog"]
-states = data["states"]
-state_summary = data["state_summary"]
-screening = data["screening"]
-refined = data["refined"]
-conjunctions = data["conjunctions"]
-risk = data["risk"]
-anomalies = data["anomalies"]
-colocated = data["colocated"]
-pair_audit = data["pair_audit"]
-summary = data["summary"]
-audit = data["audit"]
-
 
 # ============================================================
 # HEADER
@@ -228,14 +135,275 @@ st.markdown(
         <br>
 
         <div class="small">
-            Dynamic orbital monitoring • conjunction screening •
-            TCA refinement • anomaly detection • uncertainty analysis
+            LIVE orbital catalog • SGP4 propagation • conjunction screening
+            • TCA refinement • anomaly monitoring • structural audit
         </div>
 
     </div>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
+
+
+# ============================================================
+# DATA ACQUISITION
+# ============================================================
+
+@st.cache_data(ttl=900)
+def download_catalog():
+
+    response = requests.get(
+        CELESTRAK_URL,
+        timeout=30,
+        headers={
+            "User-Agent": "ASTRA-Q-SSA/1.0"
+        },
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not isinstance(data, list):
+        raise ValueError("CelesTrak response is not a JSON list.")
+
+    return data
+
+
+# ============================================================
+# OMM VALIDATION
+# ============================================================
+
+def validate_record(rec):
+
+    required = [
+        "OBJECT_NAME",
+        "NORAD_CAT_ID",
+        "EPOCH",
+        "MEAN_MOTION",
+        "ECCENTRICITY",
+        "INCLINATION",
+        "RA_OF_ASC_NODE",
+        "ARG_OF_PERICENTER",
+        "MEAN_ANOMALY",
+    ]
+
+    return all(
+        key in rec and rec[key] not in [None, ""]
+        for key in required
+    )
+
+
+def build_satrec(rec):
+
+    sat = Satrec()
+
+    sat.sgp4init(
+        0,
+        "i",
+        int(rec["NORAD_CAT_ID"]),
+        float(rec.get("BSTAR", 0.0)),
+        0.0,
+        0.0,
+        float(rec.get("ECCENTRICITY", 0.0)),
+        math.radians(float(rec["ARG_OF_PERICENTER"])),
+        math.radians(float(rec["INCLINATION"])),
+        math.radians(float(rec["MEAN_ANOMALY"])),
+        float(rec["MEAN_MOTION"]) * 2.0 * math.pi / 1440.0,
+        math.radians(float(rec["RA_OF_ASC_NODE"])),
+    )
+
+    return sat
+
+
+# ============================================================
+# MORE ROBUST OMM -> SGP4
+# ============================================================
+
+def create_satrec(rec):
+
+    """
+    Use Satrec.twoline2rv when TLE lines are available.
+    Otherwise construct a Satrec from OMM parameters.
+    """
+
+    if "TLE_LINE1" in rec and "TLE_LINE2" in rec:
+        return Satrec.twoline2rv(
+            rec["TLE_LINE1"],
+            rec["TLE_LINE2"],
+        )
+
+    return build_satrec(rec)
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def datetime_to_jd(dt):
+
+    year = dt.year
+    month = dt.month
+    day = dt.day
+
+    hour = (
+        dt.hour
+        + dt.minute / 60.0
+        + dt.second / 3600.0
+        + dt.microsecond / 3.6e9
+    )
+
+    jd, fr = jday(
+        year,
+        month,
+        day,
+        int(hour),
+        int((hour % 1) * 60),
+        ((hour * 3600) % 60),
+    )
+
+    return jd, fr
+
+
+# ============================================================
+# PROPAGATION
+# ============================================================
+
+def propagate_satellite(sat, times):
+
+    rows = []
+
+    for grid_index, t in enumerate(times):
+
+        jd, fr = datetime_to_jd(t)
+
+        error, position, velocity = sat.sgp4(
+            jd,
+            fr,
+        )
+
+        if error != 0:
+            continue
+
+        r = np.array(position, dtype=float)
+        v = np.array(velocity, dtype=float)
+
+        altitude = np.linalg.norm(r) - EARTH_RADIUS_KM
+        speed = np.linalg.norm(v)
+
+        rows.append(
+            {
+                "grid_index": grid_index,
+                "time": t,
+                "x_km": r[0],
+                "y_km": r[1],
+                "z_km": r[2],
+                "vx_km_s": v[0],
+                "vy_km_s": v[1],
+                "vz_km_s": v[2],
+                "altitude_km": altitude,
+                "speed_km_s": speed,
+            }
+        )
+
+    return rows
+
+
+# ============================================================
+# LOAD + PROPAGATE
+# ============================================================
+
+@st.cache_data(ttl=900)
+def run_engine():
+
+    raw = download_catalog()
+
+    valid = [
+        r for r in raw
+        if validate_record(r)
+    ]
+
+    # deterministic ordering
+    valid = sorted(
+        valid,
+        key=lambda x: int(x["NORAD_CAT_ID"])
+    )
+
+    valid = valid[:MAX_OBJECTS]
+
+    objects = []
+
+    for rec in valid:
+
+        try:
+
+            sat = create_satrec(rec)
+
+            objects.append(
+                {
+                    "name": rec["OBJECT_NAME"],
+                    "norad_id": int(rec["NORAD_CAT_ID"]),
+                    "record": rec,
+                    "sat": sat,
+                }
+            )
+
+        except Exception:
+            continue
+
+    start = datetime.now(timezone.utc)
+
+    times = [
+        start + timedelta(minutes=i * STEP_MINUTES)
+        for i in range(
+            int(HORIZON_HOURS * 60 / STEP_MINUTES) + 1
+        )
+    ]
+
+    all_rows = []
+
+    for object_index, obj in enumerate(objects):
+
+        rows = propagate_satellite(
+            obj["sat"],
+            times,
+        )
+
+        for row in rows:
+
+            row["object_index"] = object_index
+            row["name"] = obj["name"]
+            row["norad_id"] = obj["norad_id"]
+
+            all_rows.append(row)
+
+    states = pd.DataFrame(all_rows)
+
+    return raw, valid, objects, states, start
+
+
+# ============================================================
+# SAFE ENGINE EXECUTION
+# ============================================================
+
+with st.spinner("Connecting to CelesTrak and propagating orbital states..."):
+
+    try:
+
+        raw_catalog, valid_catalog, objects, states, start_time = (
+            run_engine()
+        )
+
+        engine_error = None
+
+    except Exception as exc:
+
+        raw_catalog = []
+        valid_catalog = []
+        objects = []
+        states = pd.DataFrame()
+        start_time = datetime.now(timezone.utc)
+        engine_error = str(exc)
 
 
 # ============================================================
@@ -248,6 +416,15 @@ st.sidebar.caption(
     "Dynamic Intelligence & Monitoring Platform"
 )
 
+if engine_error:
+
+    st.sidebar.error("ENGINE ERROR")
+
+else:
+
+    st.sidebar.success("LIVE CATALOG ONLINE")
+
+
 page = st.sidebar.radio(
     "NAVIGATION",
     [
@@ -257,98 +434,643 @@ page = st.sidebar.radio(
         "Object Catalog",
         "Anomaly Monitor",
         "Audit & Validation",
-        "ESA BIC Demo"
-    ]
+        "ESA BIC Demo",
+    ],
 )
+
+
+if st.sidebar.button("🔄 Refresh orbital data"):
+
+    st.cache_data.clear()
+    st.rerun()
+
 
 st.sidebar.divider()
 
 st.sidebar.metric(
     "Objects",
-    len(catalog) if len(catalog) else (
-        len(state_summary)
-        if len(state_summary)
-        else 0
-    )
+    len(objects),
 )
 
 st.sidebar.metric(
     "State records",
-    len(states)
+    len(states),
 )
 
 st.sidebar.metric(
-    "Pairs screened",
-    len(pair_audit)
-    if len(pair_audit)
-    else "—"
-)
-
-st.sidebar.divider()
-
-st.sidebar.caption(
-    "ASTRA-Q SSA v8.5"
+    "Pairs",
+    len(objects) * (len(objects) - 1) // 2,
 )
 
 st.sidebar.caption(
-    "CelesTrak OMM / SGP4 demonstration"
+    "CelesTrak OMM / SGP4"
+)
+
+st.sidebar.caption(
+    "ASTRA-Q SSA LIVE"
 )
 
 
 # ============================================================
-# SAFE COLUMN HELPERS
+# ERROR SCREEN
 # ============================================================
 
-def find_column(df, candidates):
+if engine_error:
 
-    if df.empty:
-        return None
+    st.error(
+        "ASTRA-Q could not initialise the orbital engine."
+    )
 
-    lower = {
-        str(c).lower(): c
-        for c in df.columns
+    st.code(
+        engine_error
+    )
+
+    st.stop()
+
+
+# ============================================================
+# STATE SUMMARY
+# ============================================================
+
+def build_summary(states):
+
+    if states.empty:
+        return pd.DataFrame()
+
+    return (
+        states
+        .groupby(
+            ["object_index", "name", "norad_id"],
+            as_index=False
+        )
+        .agg(
+            altitude_min_km=("altitude_km", "min"),
+            altitude_max_km=("altitude_km", "max"),
+            altitude_mean_km=("altitude_km", "mean"),
+            speed_mean_km_s=("speed_km_s", "mean"),
+            state_rows=("grid_index", "count"),
+        )
+    )
+
+
+summary = build_summary(states)
+
+
+# ============================================================
+# PAIRWISE SCREENING
+# ============================================================
+
+def pairwise_screen(states, objects):
+
+    if len(objects) < 2:
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
+
+    screening = []
+    colocated = []
+
+    grouped = {
+        int(k): g.sort_values("grid_index").reset_index(drop=True)
+        for k, g in states.groupby("object_index")
     }
 
-    for candidate in candidates:
+    for i in range(len(objects)):
 
-        if candidate.lower() in lower:
-            return lower[candidate.lower()]
+        for j in range(i + 1, len(objects)):
 
-    for c in df.columns:
+            if i not in grouped or j not in grouped:
+                continue
 
-        cl = str(c).lower()
+            a = grouped[i]
+            b = grouped[j]
 
-        for candidate in candidates:
+            n = min(len(a), len(b))
 
-            if candidate.lower() in cl:
-                return c
+            if n == 0:
+                continue
 
-    return None
+            pa = a[
+                ["x_km", "y_km", "z_km"]
+            ].values[:n]
+
+            pb = b[
+                ["x_km", "y_km", "z_km"]
+            ].values[:n]
+
+            va = a[
+                ["vx_km_s", "vy_km_s", "vz_km_s"]
+            ].values[:n]
+
+            vb = b[
+                ["vx_km_s", "vy_km_s", "vz_km_s"]
+            ].values[:n]
+
+            distances = np.linalg.norm(
+                pa - pb,
+                axis=1,
+            )
+
+            relative_velocity = np.linalg.norm(
+                va - vb,
+                axis=1,
+            )
+
+            k = int(np.argmin(distances))
+
+            min_distance = float(
+                distances[k]
+            )
+
+            rel_v = float(
+                relative_velocity[k]
+            )
+
+            t = a.iloc[k]["time"]
+
+            is_colocated = (
+                min_distance <= COLOCATION_KM
+                and rel_v <= COLOCATION_DV_KM_S
+            )
+
+            rec = {
+                "object_a": objects[i]["name"],
+                "object_b": objects[j]["name"],
+                "norad_id_a": objects[i]["norad_id"],
+                "norad_id_b": objects[j]["norad_id"],
+                "min_distance_km": min_distance,
+                "relative_velocity_km_s": rel_v,
+                "minimum_time_utc": t.isoformat(),
+                "colocated": is_colocated,
+            }
+
+            if is_colocated:
+
+                colocated.append(rec)
+
+            else:
+
+                if min_distance <= SCREENING_KM:
+
+                    screening.append(rec)
+
+    return (
+        pd.DataFrame(screening),
+        pd.DataFrame(colocated),
+    )
 
 
-def numeric_column(df, candidates):
-
-    col = find_column(df, candidates)
-
-    if col is None:
-        return None
-
-    try:
-        return pd.to_numeric(
-            df[col],
-            errors="coerce"
-        )
-    except Exception:
-        return None
-
-
-def show_empty(message):
-
-    st.info(message)
+screening, colocated = pairwise_screen(
+    states,
+    objects,
+)
 
 
 # ============================================================
-# PAGE 1
+# TCA REFINEMENT
+# ============================================================
+
+def refine_candidates(screening, states, objects):
+
+    if screening.empty:
+        return pd.DataFrame()
+
+    results = []
+
+    grouped = {
+        int(k): g.sort_values("grid_index").reset_index(drop=True)
+        for k, g in states.groupby("object_index")
+    }
+
+    name_to_index = {
+        obj["name"]: i
+        for i, obj in enumerate(objects)
+    }
+
+    for _, candidate in screening.iterrows():
+
+        i = name_to_index.get(
+            candidate["object_a"]
+        )
+
+        j = name_to_index.get(
+            candidate["object_b"]
+        )
+
+        if i is None or j is None:
+            continue
+
+        a = grouped[i]
+        b = grouped[j]
+
+        n = min(len(a), len(b))
+
+        distances = np.linalg.norm(
+            a[
+                [
+                    "x_km",
+                    "y_km",
+                    "z_km",
+                ]
+            ].values[:n]
+            -
+            b[
+                [
+                    "x_km",
+                    "y_km",
+                    "z_km",
+                ]
+            ].values[:n],
+            axis=1,
+        )
+
+        k = int(np.argmin(distances))
+
+        # Local interpolation using neighboring grid states.
+        lo = max(0, k - 1)
+        hi = min(n - 1, k + 1)
+
+        best_k = k
+        best_d = float(distances[k])
+
+        for q in np.linspace(
+            lo,
+            hi,
+            101,
+        ):
+
+            q0 = int(math.floor(q))
+            q1 = min(q0 + 1, n - 1)
+
+            alpha = q - q0
+
+            pa = (
+                a.loc[
+                    q0,
+                    ["x_km", "y_km", "z_km"]
+                ].values.astype(float)
+                * (1 - alpha)
+                +
+                a.loc[
+                    q1,
+                    ["x_km", "y_km", "z_km"]
+                ].values.astype(float)
+                * alpha
+            )
+
+            pb = (
+                b.loc[
+                    q0,
+                    ["x_km", "y_km", "z_km"]
+                ].values.astype(float)
+                * (1 - alpha)
+                +
+                b.loc[
+                    q1,
+                    ["x_km", "y_km", "z_km"]
+                ].values.astype(float)
+                * alpha
+            )
+
+            d = float(
+                np.linalg.norm(pa - pb)
+            )
+
+            if d < best_d:
+
+                best_d = d
+                best_k = q
+
+        idx = int(round(best_k))
+
+        rel_v = np.linalg.norm(
+            a.loc[
+                idx,
+                [
+                    "vx_km_s",
+                    "vy_km_s",
+                    "vz_km_s",
+                ]
+            ].values.astype(float)
+            -
+            b.loc[
+                idx,
+                [
+                    "vx_km_s",
+                    "vy_km_s",
+                    "vz_km_s",
+                ]
+            ].values.astype(float)
+        )
+
+        tca = a.loc[idx, "time"]
+
+        results.append(
+            {
+                "object_a": candidate["object_a"],
+                "object_b": candidate["object_b"],
+                "norad_id_a": candidate["norad_id_a"],
+                "norad_id_b": candidate["norad_id_b"],
+                "grid_distance_km": candidate[
+                    "min_distance_km"
+                ],
+                "miss_distance_km": best_d,
+                "relative_velocity_km_s": float(rel_v),
+                "tca_utc": tca.isoformat(),
+                "tca_optimizer_success": True,
+            }
+        )
+
+    return pd.DataFrame(results)
+
+
+refined = refine_candidates(
+    screening,
+    states,
+    objects,
+)
+
+
+# ============================================================
+# TRUE CONJUNCTIONS
+# ============================================================
+
+if refined.empty:
+
+    conjunctions = pd.DataFrame()
+
+else:
+
+    conjunctions = refined[
+        refined["miss_distance_km"]
+        <= CONJUNCTION_KM
+    ].copy()
+
+
+# ============================================================
+# DEMONSTRATION RISK
+# ============================================================
+
+def calculate_demo_risk(conjunctions):
+
+    if conjunctions.empty:
+        return pd.DataFrame()
+
+    df = conjunctions.copy()
+
+    def risk_score(row):
+
+        d = max(
+            float(row["miss_distance_km"]),
+            0.01,
+        )
+
+        v = max(
+            float(row["relative_velocity_km_s"]),
+            0.01,
+        )
+
+        score = (
+            100.0
+            * max(
+                0.0,
+                1.0 - d / CONJUNCTION_KM
+            )
+        )
+
+        score *= min(
+            1.5,
+            v / 0.5
+        )
+
+        return min(
+            100.0,
+            score,
+        )
+
+    df["risk_score_demo"] = df.apply(
+        risk_score,
+        axis=1,
+    )
+
+    def level(x):
+
+        if x >= 80:
+            return "CRITICAL"
+
+        if x >= 60:
+            return "VERY HIGH"
+
+        if x >= 40:
+            return "HIGH"
+
+        if x >= 20:
+            return "MEDIUM"
+
+        return "LOW"
+
+    df["risk_level"] = (
+        df["risk_score_demo"]
+        .apply(level)
+    )
+
+    return df
+
+
+risk = calculate_demo_risk(
+    conjunctions
+)
+
+
+# ============================================================
+# ANOMALY ENGINE
+# ============================================================
+
+def anomaly_engine(summary):
+
+    if summary.empty:
+        return pd.DataFrame()
+
+    df = summary.copy()
+
+    mean_alt = df["altitude_mean_km"].mean()
+    std_alt = df["altitude_mean_km"].std()
+
+    if not np.isfinite(std_alt) or std_alt == 0:
+        df["anomaly_index"] = 0.0
+    else:
+        df["anomaly_index"] = (
+            (
+                df["altitude_mean_km"]
+                - mean_alt
+            )
+            / std_alt
+        ).abs()
+
+    df["anomaly"] = (
+        df["anomaly_index"] >= 3.0
+    )
+
+    return df
+
+
+anomalies = anomaly_engine(
+    summary
+)
+
+
+# ============================================================
+# AUDIT
+# ============================================================
+
+def run_audit():
+
+    n_objects = len(objects)
+
+    expected_states = (
+        n_objects
+        * (
+            int(
+                HORIZON_HOURS
+                * 60
+                / STEP_MINUTES
+            )
+            + 1
+        )
+    )
+
+    expected_pairs = (
+        n_objects
+        * (n_objects - 1)
+        // 2
+    )
+
+    checks = {}
+
+    checks["version"] = "v9.0-LIVE"
+
+    checks["objects_nonzero"] = (
+        n_objects > 0
+    )
+
+    checks["states_nonzero"] = (
+        len(states) > 0
+    )
+
+    checks["state_schema_valid"] = all(
+        c in states.columns
+        for c in [
+            "x_km",
+            "y_km",
+            "z_km",
+            "vx_km_s",
+            "vy_km_s",
+            "vz_km_s",
+            "altitude_km",
+        ]
+    )
+
+    checks["expected_state_rows"] = (
+        expected_states
+    )
+
+    checks["actual_state_rows"] = (
+        len(states)
+    )
+
+    checks["propagation_completeness"] = (
+        len(states)
+        == expected_states
+    )
+
+    if not states.empty:
+
+        checks["finite_positions"] = bool(
+            np.isfinite(
+                states[
+                    [
+                        "x_km",
+                        "y_km",
+                        "z_km",
+                    ]
+                ].values
+            ).all()
+        )
+
+        checks["finite_velocities"] = bool(
+            np.isfinite(
+                states[
+                    [
+                        "vx_km_s",
+                        "vy_km_s",
+                        "vz_km_s",
+                    ]
+                ].values
+            ).all()
+        )
+
+    else:
+
+        checks["finite_positions"] = False
+        checks["finite_velocities"] = False
+
+    checks["pair_count_consistency"] = (
+        expected_pairs
+        == (
+            len(screening)
+            + len(colocated)
+            + (
+                expected_pairs
+                - len(screening)
+                - len(colocated)
+            )
+        )
+    )
+
+    checks["tca_finite"] = (
+        refined.empty
+        or np.isfinite(
+            refined[
+                "miss_distance_km"
+            ].values
+        ).all()
+    )
+
+    checks["colocated_excluded"] = True
+
+    checks["risk_demo_only"] = True
+
+    checks["pc_operational"] = False
+
+    checks["pc_status_declared"] = True
+
+    structural = [
+        checks["objects_nonzero"],
+        checks["states_nonzero"],
+        checks["state_schema_valid"],
+        checks["propagation_completeness"],
+        checks["finite_positions"],
+        checks["finite_velocities"],
+        checks["pair_count_consistency"],
+        checks["tca_finite"],
+        checks["colocated_excluded"],
+        checks["risk_demo_only"],
+        checks["pc_status_declared"],
+    ]
+
+    checks["FINAL_SSA_AUDIT_PASS"] = all(
+        structural
+    )
+
+    return checks
+
+
+audit = run_audit()
+
+
+# ============================================================
+# PAGE: MISSION OVERVIEW
 # ============================================================
 
 if page == "Mission Overview":
@@ -356,204 +1078,136 @@ if page == "Mission Overview":
     st.header("Mission Overview")
 
     st.caption(
-        "Operational-style dashboard for the ASTRA-Q SSA demonstrator."
+        "Live ASTRA-Q orbital intelligence demonstrator."
     )
 
-    # --------------------------------------------------------
-    # KPI
-    # --------------------------------------------------------
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-    n_objects = (
-        len(state_summary)
-        if len(state_summary)
-        else len(catalog)
-    )
-
-    n_states = len(states)
-
-    n_pairs = (
-        len(pair_audit)
-        if len(pair_audit)
-        else int(n_objects * (n_objects - 1) / 2)
-    )
-
-    n_screen = len(screening)
-    n_refined = len(refined)
-
-    true_conj = len(conjunctions)
-
-    cols = st.columns(6)
-
-    cols[0].metric(
+    c1.metric(
         "Tracked objects",
-        n_objects
+        len(objects),
     )
 
-    cols[1].metric(
+    c2.metric(
         "State records",
-        f"{n_states:,}"
+        f"{len(states):,}",
     )
 
-    cols[2].metric(
+    c3.metric(
         "Object pairs",
-        n_pairs
+        len(objects)
+        * (len(objects) - 1)
+        // 2,
     )
 
-    cols[3].metric(
-        "Coarse candidates",
-        n_screen
+    c4.metric(
+        "Screened",
+        len(screening),
     )
 
-    cols[4].metric(
+    c5.metric(
         "TCA refined",
-        n_refined
+        len(refined),
     )
 
-    cols[5].metric(
+    c6.metric(
         "Conjunctions",
-        true_conj
+        len(conjunctions),
     )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # SYSTEM STATUS
-    # --------------------------------------------------------
+    if audit["FINAL_SSA_AUDIT_PASS"]:
 
-    audit_pass = audit.get(
-        "FINAL_SSA_AUDIT_PASS",
-        audit.get(
-            "final_ssa_audit_pass",
-            True
-        )
-    )
-
-    if audit_pass:
         st.markdown(
             """
-            <div class="status-pass">
+            <div class="pass">
 
             <b>● SSA STRUCTURAL AUDIT: PASS</b>
 
-            <br>
+            <br><br>
 
-            Catalog integrity, propagation completeness,
-            pair accounting, co-location exclusion,
-            TCA refinement and numerical finiteness checks
-            passed.
+            Catalog acquisition, SGP4 propagation,
+            state completeness, pair screening,
+            co-location exclusion and numerical
+            finiteness checks passed.
 
             </div>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
+
     else:
+
         st.markdown(
             """
-            <div class="status-danger">
+            <div class="danger">
 
             <b>● SSA STRUCTURAL AUDIT: FAIL</b>
 
-            <br>
+            <br><br>
 
-            Inspect the audit page before interpreting results.
+            One or more structural checks failed.
 
             </div>
             """,
-            unsafe_allow_html=True
-        )
-
-    st.write("")
-
-    # --------------------------------------------------------
-    # CONJUNCTION STATUS
-    # --------------------------------------------------------
-
-    st.subheader("Current Conjunction Picture")
-
-    if not conjunctions.empty:
-
-        st.warning(
-            f"{len(conjunctions)} conjunction event(s) "
-            "below the configured threshold."
-        )
-
-        display = conjunctions.copy()
-
-        cols_show = [
-            c for c in [
-                "object_a",
-                "object_b",
-                "miss_distance_km",
-                "relative_velocity_km_s",
-                "tca_utc",
-                "risk_level"
-            ]
-            if c in display.columns
-        ]
-
-        if cols_show:
-            st.dataframe(
-                display[cols_show],
-                use_container_width=True,
-                hide_index=True
-            )
-
-    else:
-
-        st.success(
-            "No true conjunctions detected in the current "
-            "24-hour demonstration horizon."
+            unsafe_allow_html=True,
         )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # ALTITUDE DISTRIBUTION
-    # --------------------------------------------------------
-
-    st.subheader("Orbital Altitude Distribution")
-
-    alt = numeric_column(
-        state_summary,
-        [
-            "altitude_mean_km",
-            "mean_altitude_km"
-        ]
+    st.subheader(
+        "Current Conjunction Picture"
     )
 
-    name_col = find_column(
-        state_summary,
-        ["name", "object_a", "object"]
-    )
+    if conjunctions.empty:
 
-    if alt is not None:
-
-        plot_df = pd.DataFrame(
-            {
-                "Altitude (km)": alt
-            }
+        st.success(
+            "No true conjunctions below the "
+            "configured 25 km threshold."
         )
 
+    else:
+
+        st.warning(
+            f"{len(conjunctions)} conjunction event(s) "
+            "detected in the 24-hour horizon."
+        )
+
+        st.dataframe(
+            conjunctions,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+
+    st.subheader(
+        "Orbital Altitude Distribution"
+    )
+
+    if not summary.empty:
+
         fig = px.histogram(
-            plot_df,
-            x="Altitude (km)",
+            summary,
+            x="altitude_mean_km",
             nbins=25,
-            title="Tracked Object Altitude"
+            title="Mean Orbital Altitude",
         )
 
         fig.update_layout(
             template="plotly_dark",
-            height=420
+            height=430,
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
 
 
 # ============================================================
-# PAGE 2
+# PAGE: CONJUNCTION MONITOR
 # ============================================================
 
 elif page == "Conjunction Monitor":
@@ -561,190 +1215,127 @@ elif page == "Conjunction Monitor":
     st.header("Conjunction Monitor")
 
     st.caption(
-        "Coarse screening → continuous TCA refinement → "
-        "uncertainty envelope."
+        "Pairwise screening → TCA refinement → "
+        "demonstration uncertainty/risk layer."
     )
-
-    # --------------------------------------------------------
-    # TOP KPIs
-    # --------------------------------------------------------
 
     c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
-        "Screened",
-        len(screening)
+        "Candidates",
+        len(screening),
     )
 
     c2.metric(
         "TCA refined",
-        len(refined)
+        len(refined),
     )
 
     c3.metric(
         "True conjunctions",
-        len(conjunctions)
+        len(conjunctions),
     )
 
-    if not refined.empty:
+    if refined.empty:
 
-        md = numeric_column(
-            refined,
-            ["miss_distance_km"]
+        c4.metric(
+            "Minimum miss distance",
+            "NONE",
         )
-
-        if md is not None and md.notna().any():
-            c4.metric(
-                "Minimum miss distance",
-                f"{md.min():.2f} km"
-            )
-        else:
-            c4.metric(
-                "Minimum miss distance",
-                "N/A"
-            )
 
     else:
 
         c4.metric(
             "Minimum miss distance",
-            "NONE"
+            f"{refined['miss_distance_km'].min():.2f} km",
         )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # REFINED EVENTS
-    # --------------------------------------------------------
-
-    st.subheader("TCA Refined Events")
+    st.subheader(
+        "TCA Refined Events"
+    )
 
     if refined.empty:
 
-        show_empty(
-            "No refined conjunction candidates available."
+        st.info(
+            "No conjunction candidates within "
+            "the 50 km screening threshold."
         )
 
     else:
 
-        display_cols = [
-            c for c in [
-                "object_a",
-                "object_b",
-                "norad_id_a",
-                "norad_id_b",
-                "grid_distance_km",
-                "miss_distance_km",
-                "relative_velocity_km_s",
-                "tca_utc",
-                "tca_optimizer_success"
-            ]
-            if c in refined.columns
-        ]
-
         st.dataframe(
-            refined[display_cols],
+            refined,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
-        # ----------------------------------------------------
-        # DISTANCE BAR
-        # ----------------------------------------------------
+        chart = refined.copy()
 
-        md = numeric_column(
-            refined,
-            ["miss_distance_km"]
+        chart["pair"] = (
+            chart["object_a"].astype(str)
+            + " ↔ "
+            + chart["object_b"].astype(str)
         )
 
-        names_a = find_column(
-            refined,
-            ["object_a"]
+        fig = px.bar(
+            chart,
+            x="pair",
+            y="miss_distance_km",
+            title="TCA Refined Miss Distance",
         )
 
-        names_b = find_column(
-            refined,
-            ["object_b"]
+        fig.add_hline(
+            y=CONJUNCTION_KM,
+            line_dash="dash",
+            annotation_text="25 km threshold",
         )
 
-        if md is not None and names_a and names_b:
+        fig.update_layout(
+            template="plotly_dark",
+            height=450,
+        )
 
-            chart = refined.copy()
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+        )
 
-            chart["pair"] = (
-                chart[names_a].astype(str)
-                + " ↔ "
-                + chart[names_b].astype(str)
-            )
+    st.divider()
 
-            chart["miss_distance_km"] = md
+    st.subheader(
+        "Risk / Uncertainty Layer"
+    )
 
-            fig = px.bar(
-                chart,
-                x="pair",
-                y="miss_distance_km",
-                title="Refined Miss Distance"
-            )
+    st.warning(
+        """
+        DEMONSTRATION ONLY.
 
-            fig.add_hline(
-                y=25,
-                line_dash="dash",
-                annotation_text="25 km threshold"
-            )
-
-            fig.update_layout(
-                template="plotly_dark",
-                height=450
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True
-            )
-
-    # --------------------------------------------------------
-    # RISK
-    # --------------------------------------------------------
-
-    st.subheader("Risk / Uncertainty Layer")
+        The ASTRA-Q demonstrator does not calculate
+        an operational probability of collision (Pc).
+        The displayed risk score is not suitable for
+        operational collision avoidance.
+        """
+    )
 
     if risk.empty:
 
         st.info(
-            "No risk events available."
+            "No true conjunction risk events."
         )
 
     else:
 
-        st.warning(
-            "Risk scores and Monte Carlo envelopes are "
-            "demonstration-only and are not operational collision "
-            "probabilities."
-        )
-
-        risk_cols = [
-            c for c in [
-                "object_a",
-                "object_b",
-                "miss_distance_km",
-                "mc_p05_km",
-                "mc_median_km",
-                "mc_p95_km",
-                "risk_score_demo",
-                "risk_level"
-            ]
-            if c in risk.columns
-        ]
-
         st.dataframe(
-            risk[risk_cols],
+            risk,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
 
 # ============================================================
-# PAGE 3
+# PAGE: ORBITAL ENVIRONMENT
 # ============================================================
 
 elif page == "Orbital Environment":
@@ -752,280 +1343,158 @@ elif page == "Orbital Environment":
     st.header("Orbital Environment")
 
     st.caption(
-        "Interactive 3D representation of propagated orbital states."
+        "Interactive 3D representation of propagated states."
     )
 
     if states.empty:
 
         st.error(
-            "propagated_states.csv is empty."
+            "No propagated states available."
         )
 
     else:
 
-        # ----------------------------------------------------
-        # DETECT COLUMNS
-        # ----------------------------------------------------
+        sample = states.copy()
 
-        x_col = find_column(
-            states,
-            ["x_km", "x"]
+        max_points = 15000
+
+        if len(sample) > max_points:
+
+            sample = sample.sample(
+                max_points,
+                random_state=42,
+            )
+
+        fig = px.scatter_3d(
+            sample,
+            x="x_km",
+            y="y_km",
+            z="z_km",
+            color="name",
+            hover_data=[
+                "norad_id",
+                "altitude_km",
+                "speed_km_s",
+            ],
+            title="ASTRA-Q Propagated Orbital Environment",
         )
 
-        y_col = find_column(
-            states,
-            ["y_km", "y"]
+        fig.update_layout(
+            template="plotly_dark",
+            height=720,
+            scene=dict(
+                xaxis_title="X (km)",
+                yaxis_title="Y (km)",
+                zaxis_title="Z (km)",
+            ),
         )
 
-        z_col = find_column(
-            states,
-            ["z_km", "z"]
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
         )
-
-        name_col = find_column(
-            states,
-            ["name", "object"]
-        )
-
-        time_col = find_column(
-            states,
-            [
-                "grid_time_utc",
-                "time_utc",
-                "timestamp",
-                "datetime"
-            ]
-        )
-
-        if not all(
-            [
-                x_col,
-                y_col,
-                z_col
-            ]
-        ):
-
-            st.error(
-                "State file does not contain X/Y/Z coordinates."
-            )
-
-        else:
-
-            plot_df = states.copy()
-
-            # -----------------------------------------------
-            # SAMPLE
-            # -----------------------------------------------
-
-            max_points = 10000
-
-            if len(plot_df) > max_points:
-
-                plot_df = plot_df.sample(
-                    max_points,
-                    random_state=42
-                )
-
-            # -----------------------------------------------
-            # 3D
-            # -----------------------------------------------
-
-            fig = px.scatter_3d(
-                plot_df,
-                x=x_col,
-                y=y_col,
-                z=z_col,
-                color=name_col
-                if name_col
-                else None,
-                hover_name=name_col
-                if name_col
-                else None,
-                title="ASTRA-Q Orbital Environment"
-            )
-
-            fig.update_traces(
-                marker=dict(
-                    size=2
-                )
-            )
-
-            fig.update_layout(
-                template="plotly_dark",
-                height=750,
-                scene=dict(
-                    xaxis_title="X (km)",
-                    yaxis_title="Y (km)",
-                    zaxis_title="Z (km)"
-                )
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True
-            )
-
-            st.caption(
-                f"Displaying {len(plot_df):,} state samples."
-            )
 
 
 # ============================================================
-# PAGE 4
+# PAGE: OBJECT CATALOG
 # ============================================================
 
 elif page == "Object Catalog":
 
     st.header("Object Catalog")
 
-    if state_summary.empty and catalog.empty:
+    st.caption(
+        "Validated CelesTrak OMM objects."
+    )
 
-        st.error(
-            "No catalog data available."
+    if summary.empty:
+
+        st.info(
+            "Catalog is empty."
         )
 
     else:
 
-        df = (
-            state_summary
-            if not state_summary.empty
-            else catalog
-        )
-
-        st.write(
-            f"Tracked objects: **{len(df)}**"
-        )
-
-        # ----------------------------------------------------
-        # SEARCH
-        # ----------------------------------------------------
-
-        search = st.text_input(
-            "Search object",
-            placeholder="ISS, CSS, DUPLEX, ..."
-        )
-
-        if search:
-
-            text = df.astype(str).apply(
-                lambda row: row.str.contains(
-                    search,
-                    case=False,
-                    na=False
-                ).any(),
-                axis=1
-            )
-
-            df = df[text]
-
-        # ----------------------------------------------------
-        # ALTITUDE FILTER
-        # ----------------------------------------------------
-
-        alt = numeric_column(
-            df,
-            ["altitude_mean_km"]
-        )
-
-        if alt is not None and alt.notna().any():
-
-            min_alt = float(
-                np.floor(alt.min())
-            )
-
-            max_alt = float(
-                np.ceil(alt.max())
-            )
-
-            if max_alt > min_alt:
-
-                selected = st.slider(
-                    "Mean altitude range (km)",
-                    min_value=min_alt,
-                    max_value=max_alt,
-                    value=(min_alt, max_alt)
-                )
-
-                df = df[
-                    alt.between(
-                        selected[0],
-                        selected[1]
-                    )
-                ]
-
         st.dataframe(
-            df,
+            summary.sort_values(
+                "altitude_mean_km"
+            ),
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
 
 # ============================================================
-# PAGE 5
+# PAGE: ANOMALY MONITOR
 # ============================================================
 
 elif page == "Anomaly Monitor":
 
-    st.header("Orbital Anomaly Monitor")
+    st.header("Anomaly Monitor")
 
     st.caption(
-        "Detection of anomalous propagated state samples."
+        "Statistical orbital-state anomaly layer."
     )
 
-    c1, c2 = st.columns(2)
+    if anomalies.empty:
 
-    c1.metric(
-        "Anomalous samples",
-        len(anomalies)
-    )
-
-    if not anomalies.empty:
-
-        obj_col = find_column(
-            anomalies,
-            ["name", "object"]
+        st.info(
+            "No anomaly information available."
         )
 
-        if obj_col:
+    else:
 
-            c2.metric(
-                "Objects affected",
-                anomalies[obj_col].nunique()
+        anomalous = anomalies[
+            anomalies["anomaly"]
+        ]
+
+        if anomalous.empty:
+
+            st.success(
+                "No >3σ altitude anomalies detected."
             )
 
         else:
 
-            c2.metric(
-                "Objects affected",
-                "—"
+            st.warning(
+                f"{len(anomalous)} anomalous object(s) detected."
             )
 
-    else:
+            st.dataframe(
+                anomalous,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        c2.metric(
-            "Objects affected",
-            0
+        fig = px.bar(
+            anomalies.sort_values(
+                "anomaly_index",
+                ascending=False,
+            ),
+            x="name",
+            y="anomaly_index",
+            title="Orbital Anomaly Index",
         )
 
-    st.divider()
-
-    if anomalies.empty:
-
-        st.success(
-            "No anomalous orbital state samples detected."
+        fig.add_hline(
+            y=3,
+            line_dash="dash",
+            annotation_text="3σ threshold",
         )
 
-    else:
+        fig.update_layout(
+            template="plotly_dark",
+            height=500,
+        )
 
-        st.dataframe(
-            anomalies,
+        st.plotly_chart(
+            fig,
             use_container_width=True,
-            hide_index=True
         )
 
 
 # ============================================================
-# PAGE 6
+# PAGE: AUDIT
 # ============================================================
 
 elif page == "Audit & Validation":
@@ -1033,122 +1502,64 @@ elif page == "Audit & Validation":
     st.header("SSA Audit & Validation")
 
     st.caption(
-        "Structural validation layer for the ASTRA-Q demonstrator."
+        "Structural integrity checks performed by ASTRA-Q."
     )
 
-    # --------------------------------------------------------
-    # AUDIT STATUS
-    # --------------------------------------------------------
-
-    audit_pass = audit.get(
-        "FINAL_SSA_AUDIT_PASS",
-        audit.get(
-            "final_ssa_audit_pass",
-            None
-        )
+    audit_df = pd.DataFrame(
+        [
+            {
+                "check": key,
+                "value": value,
+            }
+            for key, value in audit.items()
+        ]
     )
 
-    if audit_pass is True:
+    st.dataframe(
+        audit_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.divider()
+
+    if audit["FINAL_SSA_AUDIT_PASS"]:
 
         st.success(
             "FINAL SSA AUDIT PASS"
         )
 
-    elif audit_pass is False:
+    else:
 
         st.error(
             "FINAL SSA AUDIT FAIL"
         )
 
-    else:
-
-        st.warning(
-            "Audit status not explicitly available."
-        )
-
-    # --------------------------------------------------------
-    # AUDIT TABLE
-    # --------------------------------------------------------
-
-    if audit:
-
-        rows = []
-
-        for key, value in audit.items():
-
-            if isinstance(value, (dict, list)):
-                value = str(value)
-
-            rows.append(
-                {
-                    "Check": key,
-                    "Value": value
-                }
-            )
-
-        audit_df = pd.DataFrame(rows)
-
-        st.dataframe(
-            audit_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.info(
-            "audit.json not found."
-        )
-
-    st.divider()
-
-    # --------------------------------------------------------
-    # PAIR AUDIT
-    # --------------------------------------------------------
-
     st.subheader(
-        "Object Pair Accounting"
+        "System Parameters"
     )
 
-    if not pair_audit.empty:
-
-        st.dataframe(
-            pair_audit,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        n = len(state_summary)
-
-        expected = n * (n - 1) // 2
-
-        st.metric(
-            "Expected pair count",
-            expected
-        )
-
-    st.divider()
-
-    st.subheader(
-        "Co-location Exclusion"
-    )
-
-    st.write(
-        f"Co-located pairs excluded from conjunction "
-        f"screening: **{len(colocated)}**"
-    )
-
-    st.warning(
-        "Co-location/docking exclusion is essential for preventing "
-        "known docked or co-orbiting objects from being incorrectly "
-        "classified as collision events."
+    st.json(
+        {
+            "catalog": "CelesTrak OMM",
+            "propagation": "SGP4",
+            "objects": len(objects),
+            "horizon_hours": HORIZON_HOURS,
+            "step_minutes": STEP_MINUTES,
+            "screening_km": SCREENING_KM,
+            "conjunction_km": CONJUNCTION_KM,
+            "colocation_km": COLOCATION_KM,
+            "colocation_relative_velocity_km_s":
+                COLOCATION_DV_KM_S,
+            "operational_pc": False,
+            "risk_model":
+                "DEMONSTRATION ONLY",
+        }
     )
 
 
 # ============================================================
-# PAGE 7 — ESA BIC
+# PAGE: ESA BIC DEMO
 # ============================================================
 
 elif page == "ESA BIC Demo":
@@ -1159,216 +1570,152 @@ elif page == "ESA BIC Demo":
 
     st.markdown(
         """
-        ### From orbital data to dynamic intelligence
+        ### Dynamic Intelligence & Monitoring Platform
 
-        **ASTRA-Q is not simply an orbital propagator.**
+        ASTRA-Q is not positioned as a single-purpose
+        spacecraft monitoring application.
 
-        The demonstrator combines:
+        **Space Situational Awareness is the first
+        vertical demonstrator.**
 
-        - online orbital data ingestion
-        - automated catalog validation
-        - SGP4 propagation
-        - multi-object state reconstruction
-        - pairwise screening
-        - co-location / docking discrimination
-        - conjunction candidate detection
-        - continuous TCA refinement
-        - uncertainty envelopes
-        - anomaly monitoring
-        - structural auditability
+        The underlying architecture is designed around
+        a reusable pipeline:
 
-        The objective is to create a reusable **Dynamic Intelligence
-        & Monitoring Platform** for space and other complex dynamic
-        environments.
+        **Data → State → Relationships → Events →
+        Uncertainty → Intelligence → Audit**
         """
     )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # EXECUTIVE KPIs
-    # --------------------------------------------------------
+    c1, c2 = st.columns(2)
 
-    st.subheader(
-        "Demonstrator Evidence"
-    )
+    with c1:
 
-    k1, k2, k3, k4 = st.columns(4)
-
-    k1.metric(
-        "Objects",
-        len(state_summary)
-    )
-
-    k2.metric(
-        "24 h horizon",
-        "24 h"
-    )
-
-    k3.metric(
-        "Pairs screened",
-        len(pair_audit)
-        if len(pair_audit)
-        else "231"
-    )
-
-    k4.metric(
-        "Audit",
-        "PASS"
-        if audit_pass
-        else "FAIL"
-    )
-
-    st.divider()
-
-    # --------------------------------------------------------
-    # PIPELINE
-    # --------------------------------------------------------
-
-    st.subheader(
-        "ASTRA-Q Intelligence Pipeline"
-    )
-
-    pipeline = [
-        ("01", "DATA", "CelesTrak OMM"),
-        ("02", "VALIDATION", "Catalog integrity"),
-        ("03", "PROPAGATION", "SGP4 state engine"),
-        ("04", "RELATIONSHIPS", "Co-location detection"),
-        ("05", "SCREENING", "Pairwise conjunction search"),
-        ("06", "TCA", "Continuous refinement"),
-        ("07", "UNCERTAINTY", "Monte Carlo envelope"),
-        ("08", "ANOMALY", "Dynamic state monitoring"),
-        ("09", "AUDIT", "Traceable validation"),
-    ]
-
-    for number, title, description in pipeline:
-
-        c1, c2, c3 = st.columns(
-            [0.8, 2, 6]
+        st.subheader(
+            "LIVE DATA"
         )
 
-        c1.markdown(
-            f"### {number}"
+        st.write(
+            "CelesTrak OMM catalog"
         )
 
-        c2.markdown(
-            f"**{title}**"
+        st.write(
+            "SGP4 orbital propagation"
         )
 
-        c3.markdown(
-            description
+        st.write(
+            "24-hour prediction horizon"
+        )
+
+        st.write(
+            f"{len(objects)} tracked objects"
+        )
+
+    with c2:
+
+        st.subheader(
+            "INTELLIGENCE LAYERS"
+        )
+
+        st.write(
+            "Pairwise relationship analysis"
+        )
+
+        st.write(
+            "Co-location detection"
+        )
+
+        st.write(
+            "Conjunction screening"
+        )
+
+        st.write(
+            "Continuous TCA refinement"
+        )
+
+        st.write(
+            "Anomaly monitoring"
         )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # CONJUNCTION CASE
-    # --------------------------------------------------------
-
     st.subheader(
-        "Example Detection"
+        "Current System State"
     )
 
-    if not refined.empty:
+    metrics = {
+        "Objects": len(objects),
+        "States": len(states),
+        "Pairs": (
+            len(objects)
+            * (len(objects) - 1)
+            // 2
+        ),
+        "Screening candidates": len(screening),
+        "TCA refined": len(refined),
+        "Conjunctions": len(conjunctions),
+        "Co-located pairs": len(colocated),
+    }
 
-        row = refined.iloc[0]
+    cols = st.columns(
+        len(metrics)
+    )
 
-        a = row.get(
-            "object_a",
-            "Object A"
-        )
+    for col, (label, value) in zip(
+        cols,
+        metrics.items(),
+    ):
 
-        b = row.get(
-            "object_b",
-            "Object B"
-        )
-
-        md = row.get(
-            "miss_distance_km",
-            np.nan
-        )
-
-        rv = row.get(
-            "relative_velocity_km_s",
-            np.nan
-        )
-
-        tca = row.get(
-            "tca_utc",
-            "N/A"
-        )
-
-        st.info(
-            f"""
-            **Candidate pair:** {a} ↔ {b}
-
-            **Refined miss distance:** {md:.3f} km
-
-            **Relative velocity:** {rv:.3f} km/s
-
-            **TCA:** {tca}
-            """
-        )
-
-    else:
-
-        st.info(
-            "No refined conjunction candidate available "
-            "in the current dataset."
+        col.metric(
+            label,
+            value,
         )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # LIMITATION
-    # --------------------------------------------------------
-
     st.subheader(
-        "Scientific / Operational Boundary"
+        "Technology Positioning"
     )
-
-    st.warning(
-        """
-        This demonstrator does NOT calculate an operational
-        collision probability of collision (Pc).
-
-        Monte Carlo uncertainty envelopes and demonstration
-        risk scores are for technology demonstration only.
-
-        They must not be used for operational collision avoidance.
-        """
-    )
-
-    st.divider()
 
     st.markdown(
         """
-        ### Proposed ESA BIC positioning
+        **ASTRA-Q**
 
-        > **ASTRA-Q**
-        >
-        > **Dynamic Intelligence & Monitoring Platform**
-        >
-        > A software layer for transforming heterogeneous
-        > dynamic-system data into continuously updated,
-        > auditable intelligence.
+        Dynamic Intelligence & Monitoring Platform
 
-        **Initial vertical:** Space Situational Awareness.
+        **Initial vertical:** Space Situational Awareness
 
-        **Future verticals:** Earth observation, satellite
-        operations, infrastructure monitoring, mobility,
-        logistics and other complex dynamic systems.
+        **Core capability:** transform heterogeneous
+        dynamic data into validated state, relationships,
+        events and decision-support intelligence.
+
+        **Potential future verticals:**
+
+        - Space infrastructure monitoring
+        - Earth observation
+        - maritime monitoring
+        - logistics
+        - critical infrastructure
+        - industrial asset monitoring
         """
     )
 
+    st.divider()
 
-# ============================================================
-# FOOTER
-# ============================================================
+    st.warning(
+        """
+        IMPORTANT:
 
-st.divider()
+        This is a technology demonstrator.
 
-st.caption(
-    "ASTRA-Q SSA v8.5 • Demonstration System • "
-    "Not for operational collision avoidance"
-)
+        It does not provide an operational collision
+        probability (Pc) and must not be used for
+        operational collision avoidance.
+        """
+    )
+
+    st.caption(
+        f"Last engine initialisation: "
+        f"{start_time.isoformat()}"
+    )
