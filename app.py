@@ -1,6 +1,7 @@
 import json
-import os
-from datetime import datetime, timedelta, timezone
+import math
+from pathlib import Path
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -8,24 +9,14 @@ import streamlit as st
 
 try:
     from sgp4.api import Satrec, jday
-except ImportError:
-    st.error("Manca il pacchetto sgp4. Controlla requirements.txt.")
-    st.stop()
+    SGP4_AVAILABLE = True
+except Exception:
+    SGP4_AVAILABLE = False
 
 
 # ============================================================
 # ASTRA-Q SSA
-# Streamlit application
-# ============================================================
-
-APP_VERSION = "ASTRA-Q SSA v8.6"
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(BASE_DIR, "data", "stations_omm.json")
-
-
-# ============================================================
-# PAGE
+# Streamlit demonstration
 # ============================================================
 
 st.set_page_config(
@@ -36,7 +27,23 @@ st.set_page_config(
 
 
 # ============================================================
-# CSS
+# CONFIGURATION
+# ============================================================
+
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+CATALOG_FILE = DATA_DIR / "stations_omm.json"
+
+DEFAULT_HORIZON_H = 24
+DEFAULT_STEP_MIN = 5
+DEFAULT_SCREENING_KM = 50.0
+DEFAULT_CONJUNCTION_KM = 25.0
+DEFAULT_COLOCATION_KM = 5.0
+DEFAULT_COLOCATION_VREL = 0.050
+
+
+# ============================================================
+# STYLE
 # ============================================================
 
 st.markdown(
@@ -44,13 +51,13 @@ st.markdown(
     <style>
 
     .main-title {
-        font-size: 38px;
+        font-size: 42px;
         font-weight: 700;
         margin-bottom: 0px;
     }
 
     .subtitle {
-        font-size: 17px;
+        font-size: 18px;
         opacity: 0.75;
         margin-bottom: 25px;
     }
@@ -62,18 +69,18 @@ st.markdown(
         text-align: center;
     }
 
-    .risk-critical {
-        color: #ff3333;
+    .status-pass {
+        color: #16a34a;
         font-weight: 700;
     }
 
-    .risk-high {
-        color: #ff9900;
+    .status-warn {
+        color: #d97706;
         font-weight: 700;
     }
 
-    .risk-low {
-        color: #33aa66;
+    .status-fail {
+        color: #dc2626;
         font-weight: 700;
     }
 
@@ -101,28 +108,31 @@ st.markdown(
 
 
 # ============================================================
-# LOAD LOCAL OMM
+# CATALOG LOADER
 # ============================================================
 
 @st.cache_data
 def load_catalog():
 
-    if not os.path.exists(DATA_FILE):
+    if not CATALOG_FILE.exists():
         raise FileNotFoundError(
-            f"Missing local catalog: {DATA_FILE}"
+            f"Catalogo non trovato: {CATALOG_FILE}"
         )
 
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    with open(CATALOG_FILE, "r", encoding="utf-8") as f:
+        raw = json.load(f)
 
-    if isinstance(payload, dict) and "objects" in payload:
-        records = payload["objects"]
-        metadata = payload
-    elif isinstance(payload, list):
-        records = payload
-        metadata = {}
+    if isinstance(raw, dict):
+        if "data" in raw:
+            records = raw["data"]
+        elif "objects" in raw:
+            records = raw["objects"]
+        else:
+            records = [raw]
+    elif isinstance(raw, list):
+        records = raw
     else:
-        raise ValueError("Invalid stations_omm.json format")
+        raise ValueError("Formato stations_omm.json non valido.")
 
     valid = []
 
@@ -131,85 +141,176 @@ def load_catalog():
         if not isinstance(r, dict):
             continue
 
-        if "NORAD_CAT_ID" not in r:
-            continue
-
-        valid.append(r)
-
-    return valid, metadata
-
-
-# ============================================================
-# BUILD SGP4
-# ============================================================
-
-def build_satrec(record):
-
-    # OMM JSON from CelesTrak
-    sat = Satrec()
-
-    sat.sgp4init(
-        72,
-        float(record["CLASSIFICATION"]),
-        float(record["NORAD_CAT_ID"]),
-        float(record["ELEMENT_SET_NO"]),
-        float(record["EPOCH"]),
-        float(record["MEAN_MOTION_DOT"]),
-        float(record["MEAN_MOTION_DDOT"]),
-        float(record["BSTAR"]),
-        int(record["EPHEMERIS_TYPE"]),
-        int(record["ELSET_NUM"]),
-        float(record["INCLINATION"]),
-        float(record["RA_OF_ASC_NODE"]),
-        float(record["ECCENTRICITY"]),
-        float(record["ARG_OF_PERICENTER"]),
-        float(record["MEAN_ANOMALY"]),
-        float(record["MEAN_MOTION"]),
-        int(record["REV_AT_EPOCH"]),
-    )
-
-    return sat
-
-
-# ============================================================
-# SAFE OMM CONVERSION
-# ============================================================
-
-def make_satellite(record):
-
-    try:
-        sat = Satrec()
-
-        # Prefer Satrec.twoline2rv if raw TLE exists
-        if "TLE_LINE1" in record and "TLE_LINE2" in record:
-            sat = Satrec.twoline2rv(
-                record["TLE_LINE1"],
-                record["TLE_LINE2"]
-            )
-            return sat
-
-        # OMM fields
-        sat.sgp4init(
-            72,
-            str(record.get("CLASSIFICATION", "U"))[0],
-            int(record["NORAD_CAT_ID"]),
-            float(record["EPOCH"]),
-            float(record["MEAN_MOTION_DOT"]),
-            float(record["MEAN_MOTION_DDOT"]),
-            float(record["BSTAR"]),
-            int(record.get("EPHEMERIS_TYPE", 0)),
-            int(record.get("ELEMENT_SET_NO", 0)),
-            np.deg2rad(float(record["INCLINATION"])),
-            np.deg2rad(float(record["RA_OF_ASC_NODE"])),
-            float(record["ECCENTRICITY"]),
-            np.deg2rad(float(record["ARG_OF_PERICENTER"])),
-            np.deg2rad(float(record["MEAN_ANOMALY"])),
-            float(record["MEAN_MOTION"]) * 2.0 * np.pi / 1440.0,
-            int(record["REV_AT_EPOCH"]),
+        name = (
+            r.get("OBJECT_NAME")
+            or r.get("OBJECT")
+            or r.get("name")
+            or r.get("NAME")
         )
 
-        return sat
+        norad = (
+            r.get("NORAD_CAT_ID")
+            or r.get("NORAD_ID")
+            or r.get("norad_id")
+            or r.get("NORAD")
+        )
 
+        line1 = r.get("TLE_LINE1")
+        line2 = r.get("TLE_LINE2")
+
+        # Alcuni cataloghi OMM contengono direttamente TLE
+        if line1 and line2 and name and norad:
+
+            valid.append(
+                {
+                    "name": str(name),
+                    "norad_id": int(norad),
+                    "line1": line1,
+                    "line2": line2,
+                    "raw": r,
+                }
+            )
+
+            continue
+
+        # Supporto OMM con elementi orbitali
+        if name and norad:
+
+            valid.append(
+                {
+                    "name": str(name),
+                    "norad_id": int(norad),
+                    "raw": r,
+                }
+            )
+
+    return valid
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("ASTRA-Q Configuration")
+
+horizon_h = st.sidebar.slider(
+    "Propagation horizon [h]",
+    min_value=1,
+    max_value=72,
+    value=DEFAULT_HORIZON_H,
+)
+
+step_min = st.sidebar.slider(
+    "Propagation step [min]",
+    min_value=1,
+    max_value=30,
+    value=DEFAULT_STEP_MIN,
+)
+
+screening_km = st.sidebar.number_input(
+    "Screening distance [km]",
+    min_value=1.0,
+    max_value=500.0,
+    value=DEFAULT_SCREENING_KM,
+)
+
+conjunction_km = st.sidebar.number_input(
+    "Conjunction threshold [km]",
+    min_value=1.0,
+    max_value=100.0,
+    value=DEFAULT_CONJUNCTION_KM,
+)
+
+max_objects = st.sidebar.slider(
+    "Maximum objects",
+    min_value=2,
+    max_value=40,
+    value=22,
+)
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+try:
+
+    catalog = load_catalog()
+
+except Exception as e:
+
+    st.error("Impossibile caricare il catalogo locale.")
+    st.exception(e)
+
+    st.stop()
+
+
+catalog = catalog[:max_objects]
+
+
+# ============================================================
+# CATALOG STATUS
+# ============================================================
+
+st.success(
+    f"LOCAL CATALOG MODE — {len(catalog)} objects loaded"
+)
+
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    st.metric("Catalog objects", len(catalog))
+
+with c2:
+    st.metric("Source", "LOCAL JSON")
+
+with c3:
+    st.metric("Horizon", f"{horizon_h} h")
+
+with c4:
+    st.metric("Step", f"{step_min} min")
+
+
+# ============================================================
+# CATALOG TABLE
+# ============================================================
+
+st.subheader("Orbital Catalog")
+
+catalog_table = pd.DataFrame(
+    [
+        {
+            "Object": x["name"],
+            "NORAD ID": x["norad_id"],
+        }
+        for x in catalog
+    ]
+)
+
+st.dataframe(
+    catalog_table,
+    use_container_width=True,
+    hide_index=True,
+)
+
+
+# ============================================================
+# SGP4
+# ============================================================
+
+def create_satrec(item):
+
+    if not SGP4_AVAILABLE:
+        return None
+
+    line1 = item.get("line1")
+    line2 = item.get("line2")
+
+    if not line1 or not line2:
+        return None
+
+    try:
+        return Satrec.twoline2rv(line1, line2)
     except Exception:
         return None
 
@@ -218,14 +319,10 @@ def make_satellite(record):
 # PROPAGATION
 # ============================================================
 
-def propagate_satellite(sat, start, hours=24, step_min=10):
+def propagate_satellite(sat, times):
 
-    n = int(hours * 60 / step_min) + 1
-
-    times = [
-        start + timedelta(minutes=i * step_min)
-        for i in range(n)
-    ]
+    if sat is None:
+        return None, None
 
     positions = []
     velocities = []
@@ -241,508 +338,524 @@ def propagate_satellite(sat, start, hours=24, step_min=10):
             t.second + t.microsecond / 1e6,
         )
 
-        error, r, v = sat.sgp4(jd, fr)
+        e, r, v = sat.sgp4(jd, fr)
 
-        if error != 0:
-            positions.append([np.nan, np.nan, np.nan])
-            velocities.append([np.nan, np.nan, np.nan])
+        if e != 0:
+            positions.append([np.nan] * 3)
+            velocities.append([np.nan] * 3)
         else:
             positions.append(r)
             velocities.append(v)
 
-    return np.asarray(positions), np.asarray(velocities), times
-
-
-# ============================================================
-# LOAD
-# ============================================================
-
-try:
-
-    records, metadata = load_catalog()
-
-except Exception as e:
-
-    st.error("Catalogo locale non disponibile.")
-
-    st.code(str(e))
-
-    st.info(
-        "Inserisci data/stations_omm.json nel repository GitHub "
-        "e riavvia l'app."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.header("ASTRA-Q CONTROL")
-
-horizon = st.sidebar.slider(
-    "Propagation horizon (hours)",
-    1,
-    48,
-    24,
-)
-
-step = st.sidebar.selectbox(
-    "Propagation step (minutes)",
-    [5, 10, 15, 30],
-    index=0,
-)
-
-threshold = st.sidebar.slider(
-    "Conjunction threshold (km)",
-    1.0,
-    100.0,
-    25.0,
-)
-
-max_objects = st.sidebar.slider(
-    "Maximum objects",
-    2,
-    min(40, len(records)),
-    min(22, len(records)),
-)
-
-
-# ============================================================
-# CATALOG TABLE
-# ============================================================
-
-st.sidebar.markdown("---")
-
-st.sidebar.metric(
-    "LOCAL OMM OBJECTS",
-    len(records)
-)
-
-st.sidebar.caption(
-    "Catalog is loaded from GitHub/local repository."
-)
-
-if metadata.get("downloaded_utc"):
-    st.sidebar.caption(
-        "Catalog timestamp: "
-        + str(metadata["downloaded_utc"])
+    return (
+        np.asarray(positions, dtype=float),
+        np.asarray(velocities, dtype=float),
     )
 
 
 # ============================================================
-# SELECT OBJECTS
+# PROPAGATION BUTTON
 # ============================================================
 
-records = records[:max_objects]
+st.subheader("Propagation Engine")
 
+if not SGP4_AVAILABLE:
 
-# ============================================================
-# PROPAGATE
-# ============================================================
-
-@st.cache_data(show_spinner=False)
-def run_propagation(records_json, horizon, step):
-
-    records_local = json.loads(records_json)
-
-    output = []
-
-    for idx, rec in enumerate(records_local):
-
-        sat = make_satellite(rec)
-
-        if sat is None:
-            continue
-
-        start = datetime.now(timezone.utc)
-
-        pos, vel, times = propagate_satellite(
-            sat,
-            start,
-            hours=horizon,
-            step_min=step,
-        )
-
-        for k, t in enumerate(times):
-
-            output.append({
-                "object_index": idx,
-                "name": rec.get(
-                    "OBJECT_NAME",
-                    rec.get("OBJECT_ID", f"OBJECT-{idx}")
-                ),
-                "norad_id": int(rec["NORAD_CAT_ID"]),
-                "time": t,
-                "x_km": pos[k, 0],
-                "y_km": pos[k, 1],
-                "z_km": pos[k, 2],
-                "vx_km_s": vel[k, 0],
-                "vy_km_s": vel[k, 1],
-                "vz_km_s": vel[k, 2],
-            })
-
-    return pd.DataFrame(output)
-
-
-records_json = json.dumps(
-    records,
-    sort_keys=True,
-    default=str,
-)
-
-
-with st.spinner("Propagating orbital states..."):
-
-    states = run_propagation(
-        records_json,
-        horizon,
-        step,
-    )
-
-
-# ============================================================
-# STATE VALIDATION
-# ============================================================
-
-if states.empty:
-
-    st.error(
-        "Nessun oggetto è stato propagato correttamente."
-    )
-
-    st.stop()
-
-
-states["altitude_km"] = (
-    np.sqrt(
-        states["x_km"] ** 2
-        + states["y_km"] ** 2
-        + states["z_km"] ** 2
-    )
-    - 6378.137
-)
-
-states["speed_km_s"] = np.sqrt(
-    states["vx_km_s"] ** 2
-    + states["vy_km_s"] ** 2
-    + states["vz_km_s"] ** 2
-)
-
-
-# ============================================================
-# OBJECT SUMMARY
-# ============================================================
-
-summary = (
-    states
-    .groupby(["object_index", "name", "norad_id"])
-    .agg(
-        altitude_min_km=("altitude_km", "min"),
-        altitude_max_km=("altitude_km", "max"),
-        altitude_mean_km=("altitude_km", "mean"),
-        speed_mean_km_s=("speed_km_s", "mean"),
-        state_rows=("altitude_km", "count"),
-    )
-    .reset_index()
-)
-
-
-# ============================================================
-# PAIR SCREENING
-# ============================================================
-
-def pair_screening(states_df, threshold_km):
-
-    pairs = []
-
-    grouped = {
-        k: g.sort_values("time").reset_index(drop=True)
-        for k, g in states_df.groupby("object_index")
-    }
-
-    object_ids = sorted(grouped.keys())
-
-    for i in range(len(object_ids)):
-
-        for j in range(i + 1, len(object_ids)):
-
-            a = grouped[object_ids[i]]
-            b = grouped[object_ids[j]]
-
-            n = min(len(a), len(b))
-
-            if n == 0:
-                continue
-
-            dr = (
-                a[
-                    ["x_km", "y_km", "z_km"]
-                ].values[:n]
-                -
-                b[
-                    ["x_km", "y_km", "z_km"]
-                ].values[:n]
-            )
-
-            distance = np.linalg.norm(dr, axis=1)
-
-            k = int(np.nanargmin(distance))
-
-            dmin = float(distance[k])
-
-            pairs.append({
-                "object_a": a.iloc[0]["name"],
-                "object_b": b.iloc[0]["name"],
-                "object_index_a": int(object_ids[i]),
-                "object_index_b": int(object_ids[j]),
-                "min_distance_km": dmin,
-                "time": a.iloc[k]["time"],
-                "candidate": dmin <= threshold_km,
-            })
-
-    return pd.DataFrame(pairs)
-
-
-pairs = pair_screening(
-    states,
-    threshold,
-)
-
-
-# ============================================================
-# DASHBOARD METRICS
-# ============================================================
-
-n_objects = len(summary)
-n_states = len(states)
-n_pairs = len(pairs)
-
-candidates = (
-    int(pairs["candidate"].sum())
-    if not pairs.empty
-    else 0
-)
-
-min_distance = (
-    float(pairs["min_distance_km"].min())
-    if not pairs.empty
-    else np.nan
-)
-
-
-c1, c2, c3, c4, c5 = st.columns(5)
-
-c1.metric(
-    "Objects",
-    n_objects,
-)
-
-c2.metric(
-    "State rows",
-    n_states,
-)
-
-c3.metric(
-    "Pairs",
-    n_pairs,
-)
-
-c4.metric(
-    "Candidates",
-    candidates,
-)
-
-c5.metric(
-    "Minimum distance",
-    "—" if np.isnan(min_distance)
-    else f"{min_distance:.2f} km",
-)
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-if candidates == 0:
-
-    st.success(
-        "NO CONJUNCTION CANDIDATES BELOW THRESHOLD"
+    st.warning(
+        "sgp4 non disponibile. Verifica requirements.txt."
     )
 
 else:
 
-    st.warning(
-        f"{candidates} conjunction candidate(s) detected"
-    )
-
-
-# ============================================================
-# TABS
-# ============================================================
-
-tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "🛰️ OBJECTS",
-        "⚠️ CONJUNCTIONS",
-        "📈 ORBITS",
-        "🔍 AUDIT",
-    ]
-)
-
-
-# ============================================================
-# OBJECTS
-# ============================================================
-
-with tab1:
-
-    st.subheader("Orbital State Engine")
-
-    st.dataframe(
-        summary,
+    if st.button(
+        "▶ RUN ASTRA-Q SSA",
+        type="primary",
         use_container_width=True,
-        hide_index=True,
-    )
+    ):
 
+        start = datetime.now(timezone.utc)
 
-# ============================================================
-# CONJUNCTIONS
-# ============================================================
+        times = pd.date_range(
+            start=start,
+            periods=int(horizon_h * 60 / step_min) + 1,
+            freq=f"{step_min}min",
+            tz="UTC",
+        ).to_pydatetime()
 
-with tab2:
+        states = {}
+        summaries = []
 
-    st.subheader("Conjunction Screening")
+        progress = st.progress(0)
 
-    if pairs.empty:
+        for idx, item in enumerate(catalog):
 
-        st.info("No pairs available.")
+            sat = create_satrec(item)
 
-    else:
+            if sat is None:
+                continue
 
-        candidates_df = pairs[
-            pairs["candidate"]
-        ].sort_values(
-            "min_distance_km"
-        )
+            pos, vel = propagate_satellite(
+                sat,
+                times,
+            )
 
-        if candidates_df.empty:
+            if pos is None:
+                continue
 
-            st.success(
-                "No candidates below threshold."
+            states[item["norad_id"]] = {
+                "name": item["name"],
+                "norad_id": item["norad_id"],
+                "times": times,
+                "positions": pos,
+                "velocities": vel,
+            }
+
+            radius = np.linalg.norm(pos, axis=1)
+
+            altitude = radius - 6378.137
+
+            speed = np.linalg.norm(vel, axis=1)
+
+            summaries.append(
+                {
+                    "name": item["name"],
+                    "norad_id": item["norad_id"],
+                    "altitude_min_km": np.nanmin(altitude),
+                    "altitude_max_km": np.nanmax(altitude),
+                    "altitude_mean_km": np.nanmean(altitude),
+                    "speed_mean_km_s": np.nanmean(speed),
+                    "state_rows": len(times),
+                }
+            )
+
+            progress.progress(
+                (idx + 1) / len(catalog)
+            )
+
+        progress.empty()
+
+        summary_df = pd.DataFrame(summaries)
+
+        # ====================================================
+        # PAIR SCREENING
+        # ====================================================
+
+        pairs = []
+
+        ids = list(states.keys())
+
+        for i in range(len(ids)):
+
+            for j in range(i + 1, len(ids)):
+
+                a = states[ids[i]]
+                b = states[ids[j]]
+
+                dp = (
+                    a["positions"]
+                    - b["positions"]
+                )
+
+                dv = (
+                    a["velocities"]
+                    - b["velocities"]
+                )
+
+                distances = np.linalg.norm(
+                    dp,
+                    axis=1,
+                )
+
+                velocities = np.linalg.norm(
+                    dv,
+                    axis=1,
+                )
+
+                k = int(np.nanargmin(distances))
+
+                dmin = float(distances[k])
+
+                vrel = float(velocities[k])
+
+                colocated = (
+                    dmin <= DEFAULT_COLOCATION_KM
+                    and
+                    vrel <= DEFAULT_COLOCATION_VREL
+                )
+
+                if colocated:
+                    relation = "CO-LOCATED"
+                else:
+                    relation = "INDEPENDENT"
+
+                pairs.append(
+                    {
+                        "object_a": a["name"],
+                        "object_b": b["name"],
+                        "norad_id_a": a["norad_id"],
+                        "norad_id_b": b["norad_id"],
+                        "min_distance_km": dmin,
+                        "relative_velocity_km_s": vrel,
+                        "colocated": bool(colocated),
+                        "relation": relation,
+                        "grid_index": k,
+                        "time": a["times"][k],
+                    }
+                )
+
+        pairs_df = pd.DataFrame(pairs)
+
+        if pairs_df.empty:
+
+            st.warning("Nessuna coppia disponibile.")
+
+            independent_df = pd.DataFrame()
+
+        else:
+
+            independent_df = pairs_df[
+                pairs_df["colocated"] == False
+            ].copy()
+
+        # ====================================================
+        # CONJUNCTIONS
+        # ====================================================
+
+        if not independent_df.empty:
+
+            candidates = independent_df[
+                independent_df["min_distance_km"]
+                <= screening_km
+            ].copy()
+
+            candidates = candidates.sort_values(
+                "min_distance_km"
             )
 
         else:
 
-            st.dataframe(
-                candidates_df,
-                use_container_width=True,
-                hide_index=True,
-            )
+            candidates = pd.DataFrame()
 
-            st.markdown(
-                """
-                **Risk model status**
+        true_conjunctions = candidates[
+            candidates["min_distance_km"]
+            <= conjunction_km
+        ].copy()
 
-                Operational collision probability (**Pc**) is
-                **not calculated**.
+        # ====================================================
+        # SAVE RESULTS IN SESSION
+        # ====================================================
 
-                This dashboard performs geometric conjunction
-                screening only.
-                """
-            )
+        st.session_state["states"] = states
+        st.session_state["summary"] = summary_df
+        st.session_state["pairs"] = pairs_df
+        st.session_state["candidates"] = candidates
+        st.session_state["conjunctions"] = true_conjunctions
+
+        st.session_state["run_time"] = start
 
 
 # ============================================================
-# ORBITAL VISUALIZATION
+# RESULTS
 # ============================================================
 
-with tab3:
+if "summary" not in st.session_state:
 
-    st.subheader("Altitude Evolution")
-
-    chart_df = states[
-        ["time", "name", "altitude_km"]
-    ].pivot(
-        index="time",
-        columns="name",
-        values="altitude_km",
+    st.info(
+        "Premi **RUN ASTRA-Q SSA** per eseguire la propagazione."
     )
 
-    st.line_chart(
-        chart_df,
-        height=500,
+else:
+
+    summary_df = st.session_state["summary"]
+    pairs_df = st.session_state["pairs"]
+    candidates = st.session_state["candidates"]
+    conjunctions = st.session_state["conjunctions"]
+
+    # ========================================================
+    # KPIs
+    # ========================================================
+
+    st.subheader("SSA Mission Dashboard")
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    with k1:
+        st.metric(
+            "Objects",
+            len(summary_df),
+        )
+
+    with k2:
+        st.metric(
+            "Pairs",
+            len(pairs_df),
+        )
+
+    with k3:
+        st.metric(
+            "Screened",
+            len(candidates),
+        )
+
+    with k4:
+        st.metric(
+            "Conjunctions",
+            len(conjunctions),
+        )
+
+    with k5:
+
+        if len(conjunctions) > 0:
+            st.metric(
+                "STATUS",
+                "ALERT",
+            )
+        else:
+            st.metric(
+                "STATUS",
+                "NOMINAL",
+            )
+
+    # ========================================================
+    # CONJUNCTIONS
+    # ========================================================
+
+    st.subheader("Conjunction Analysis")
+
+    if conjunctions.empty:
+
+        st.success(
+            "No conjunctions below the configured threshold."
+        )
+
+    else:
+
+        st.warning(
+            f"{len(conjunctions)} conjunction candidate(s) "
+            "below threshold."
+        )
+
+        display = conjunctions[
+            [
+                "object_a",
+                "object_b",
+                "norad_id_a",
+                "norad_id_b",
+                "min_distance_km",
+                "relative_velocity_km_s",
+                "time",
+            ]
+        ].copy()
+
+        display.columns = [
+            "Object A",
+            "Object B",
+            "NORAD A",
+            "NORAD B",
+            "Miss distance [km]",
+            "Relative velocity [km/s]",
+            "TCA grid time",
+        ]
+
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # ========================================================
+    # SCREENING
+    # ========================================================
+
+    st.subheader("Screening Results")
+
+    if candidates.empty:
+
+        st.info("No screening candidates.")
+
+    else:
+
+        st.dataframe(
+            candidates,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # ========================================================
+    # ORBITAL SUMMARY
+    # ========================================================
+
+    st.subheader("Orbital State Summary")
+
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
     )
 
+    # ========================================================
+    # ALTITUDE CHART
+    # ========================================================
 
-# ============================================================
-# AUDIT
-# ============================================================
+    st.subheader("Altitude Profile")
 
-with tab4:
+    states = st.session_state["states"]
+
+    altitude_data = []
+
+    for sid, state in states.items():
+
+        radius = np.linalg.norm(
+            state["positions"],
+            axis=1,
+        )
+
+        altitude = radius - 6378.137
+
+        for t, alt in zip(
+            state["times"],
+            altitude,
+        ):
+
+            altitude_data.append(
+                {
+                    "time": t,
+                    "object": state["name"],
+                    "altitude_km": alt,
+                }
+            )
+
+    altitude_df = pd.DataFrame(
+        altitude_data
+    )
+
+    if not altitude_df.empty:
+
+        chart_df = altitude_df.pivot(
+            index="time",
+            columns="object",
+            values="altitude_km",
+        )
+
+        st.line_chart(
+            chart_df,
+            height=450,
+        )
+
+    # ========================================================
+    # RELATIONSHIP AUDIT
+    # ========================================================
+
+    st.subheader("Object Relationship Audit")
+
+    if not pairs_df.empty:
+
+        colocated_count = int(
+            pairs_df["colocated"].sum()
+        )
+
+        independent_count = (
+            len(pairs_df)
+            - colocated_count
+        )
+
+        a1, a2, a3 = st.columns(3)
+
+        with a1:
+            st.metric(
+                "Total pairs",
+                len(pairs_df),
+            )
+
+        with a2:
+            st.metric(
+                "Co-located",
+                colocated_count,
+            )
+
+        with a3:
+            st.metric(
+                "Independent",
+                independent_count,
+            )
+
+    # ========================================================
+    # AUDIT
+    # ========================================================
 
     st.subheader("ASTRA-Q Structural Audit")
 
-    expected_rows = (
-        n_objects
-        * (int(horizon * 60 / step) + 1)
-    )
+    checks = {
+        "objects_nonzero":
+            len(summary_df) > 0,
 
-    actual_rows = len(states)
+        "states_nonzero":
+            len(states) > 0,
 
-    audit = {
-        "version": APP_VERSION,
-        "catalog_local": True,
-        "catalog_objects": len(records),
-        "objects_propagated": n_objects,
-        "states_expected": expected_rows,
-        "states_actual": actual_rows,
-        "states_nonzero": actual_rows > 0,
-        "state_schema_valid": all(
-            c in states.columns
-            for c in [
-                "x_km",
-                "y_km",
-                "z_km",
-                "vx_km_s",
-                "vy_km_s",
-                "vz_km_s",
-            ]
-        ),
-        "finite_positions": bool(
-            np.isfinite(
-                states[
-                    ["x_km", "y_km", "z_km"]
-                ].values
-            ).all()
-        ),
-        "finite_velocities": bool(
-            np.isfinite(
-                states[
-                    ["vx_km_s", "vy_km_s", "vz_km_s"]
-                ].values
-            ).all()
-        ),
-        "pair_count": n_pairs,
-        "conjunction_candidates": candidates,
-        "operational_pc": False,
-        "risk_model": "GEOMETRIC_SCREENING_ONLY",
+        "pair_count_consistency":
+            len(pairs_df)
+            == (
+                len(summary_df)
+                * (len(summary_df) - 1)
+                // 2
+            ),
+
+        "finite_positions":
+            all(
+                np.isfinite(
+                    s["positions"]
+                ).all()
+                for s in states.values()
+            ),
+
+        "finite_velocities":
+            all(
+                np.isfinite(
+                    s["velocities"]
+                ).all()
+                for s in states.values()
+            ),
+
+        "state_rows_consistent":
+            all(
+                len(s["times"])
+                == horizon_h * 60 // step_min + 1
+                for s in states.values()
+            ),
+
+        "colocated_excluded":
+            (
+                pairs_df.empty
+                or (
+                    len(
+                        candidates[
+                            candidates["colocated"] == True
+                        ]
+                    )
+                    == 0
+                    if "colocated" in candidates.columns
+                    else True
+                )
+            ),
     }
 
-    audit["FINAL_SSA_AUDIT_PASS"] = all([
-        audit["catalog_objects"] > 0,
-        audit["objects_propagated"] > 0,
-        audit["states_nonzero"],
-        audit["state_schema_valid"],
-        audit["states_actual"] == audit["states_expected"],
-        audit["finite_positions"],
-        audit["finite_velocities"],
-    ])
+    audit_df = pd.DataFrame(
+        [
+            {
+                "check": k,
+                "PASS": bool(v),
+            }
+            for k, v in checks.items()
+        ]
+    )
 
-    st.json(audit)
+    st.dataframe(
+        audit_df,
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    if audit["FINAL_SSA_AUDIT_PASS"]:
+    if all(checks.values()):
 
         st.success(
             "FINAL SSA AUDIT PASS"
@@ -754,16 +867,45 @@ with tab4:
             "FINAL SSA AUDIT FAIL"
         )
 
+    # ========================================================
+    # DOWNLOADS
+    # ========================================================
+
+    st.subheader("Export")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.download_button(
+            "Download state_summary.csv",
+            summary_df.to_csv(
+                index=False
+            ),
+            file_name="state_summary.csv",
+            mime="text/csv",
+        )
+
+    with col2:
+
+        st.download_button(
+            "Download conjunctions.csv",
+            conjunctions.to_csv(
+                index=False
+            ),
+            file_name="conjunction_events.csv",
+            mime="text/csv",
+        )
+
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.markdown("---")
+st.divider()
 
 st.caption(
-    f"{APP_VERSION} | "
-    "Local OMM catalog | "
-    "SGP4 propagation | "
-    "Geometric conjunction screening"
+    "ASTRA-Q SSA — Demonstration platform. "
+    "Propagation based on local catalog data. "
+    "No operational collision probability is calculated."
 )
