@@ -1,7 +1,8 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone, UTC
+import requests  # <--- AGGIUNGI QUESTA RIGA
+from datetime import datetime, timezone
 # e poi usare:
 start_time = datetime.now(UTC)
 # ---> DEVE ESSERE IL PRIMISSIMO COMANDO STREAMLIT <---
