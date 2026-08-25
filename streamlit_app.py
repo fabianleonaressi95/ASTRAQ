@@ -1,7 +1,9 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-
+from datetime import datetime, timezone, UTC
+# e poi usare:
+start_time = datetime.now(UTC)
 # ---> DEVE ESSERE IL PRIMISSIMO COMANDO STREAMLIT <---
 st.set_page_config(
     page_title="ASTRA-Q SSA",
