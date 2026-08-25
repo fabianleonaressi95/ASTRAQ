@@ -14,32 +14,31 @@ st.set_page_config(
 
 # Da qui in poi puoi mettere tutto il resto del codice, titoli, widget, ecc.
 st.markdown('<div class="hero-title">🛰️ ASTRA-Q SSA</div>', unsafe_allow_html=True)
-def load_orbital_data():
+def load_celestrak_data():
     url = "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=json"
-    local_fallback_path = "data/stations_fallback.json"
+    fallback_path = "data/stations_fallback.json"
     
     try:
-        # Tentativo di connessione con timeout esteso ed eventuale gestione
-        response = requests.get(url, timeout=10)
+        # Tentativo di connessione con timeout
+        response = requests.get(url, timeout=5)
         response.raise_for_status()
         data = response.json()
         
-        # Opzionale: salva una copia locale aggiornata da usare come fallback futuro
+        # Salva una copia locale per il futuro
         os.makedirs("data", exist_ok=True)
-        with open(local_fallback_path, "w") as f:
+        with open(fallback_path, "w") as f:
             f.write(response.text)
             
         return data
-    except (requests.exceptions.RequestException, Exception) as e:
-        print(f"[!] Connessione a CelesTrak fallita ({e}). Uso il catalogo di fallback locale...")
-        
-        # Se il server fallisce, carica i dati di riserva locali se presenti
-        if os.path.exists(local_fallback_path):
-            import json
-            with open(local_fallback_path, "r") as f:
+    except Exception as e:
+        # Se CelesTrak fallisce, prova a leggere il file locale di fallback
+        if os.path.exists(fallback_path):
+            st.warning("⚠️ Impossibile raggiungere CelesTrak in tempo reale. Caricamento del catalogo orbitale di fallback locale.")
+            with open(fallback_path, "r") as f:
                 return json.load(f)
         else:
-            raise RuntimeError("Impossibile contattare CelesTrak e nessun file di fallback locale trovato nella cartella /data.")
+            st.error(f"Errore critico: Connessione a CelesTrak fallita ({e}) e nessun file di backup locale trovato.")
+            return None
 
 
 # ============================================================
