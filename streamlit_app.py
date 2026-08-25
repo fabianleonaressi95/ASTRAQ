@@ -1,15 +1,33 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import os
 import requests
-import json
-import math
-from datetime import datetime, timezone, timedelta
+import pandas as pd
 
-import plotly.express as px
-import plotly.graph_objects as go
-
-from sgp4.api import Satrec, jday
+def load_orbital_data():
+    url = "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=json"
+    local_fallback_path = "data/stations_fallback.json"
+    
+    try:
+        # Tentativo di connessione con timeout esteso ed eventuale gestione
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Opzionale: salva una copia locale aggiornata da usare come fallback futuro
+        os.makedirs("data", exist_ok=True)
+        with open(local_fallback_path, "w") as f:
+            f.write(response.text)
+            
+        return data
+    except (requests.exceptions.RequestException, Exception) as e:
+        print(f"[!] Connessione a CelesTrak fallita ({e}). Uso il catalogo di fallback locale...")
+        
+        # Se il server fallisce, carica i dati di riserva locali se presenti
+        if os.path.exists(local_fallback_path):
+            import json
+            with open(local_fallback_path, "r") as f:
+                return json.load(f)
+        else:
+            raise RuntimeError("Impossibile contattare CelesTrak e nessun file di fallback locale trovato nella cartella /data.")
 
 
 # ============================================================
