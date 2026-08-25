@@ -1,7 +1,16 @@
-import os
-import requests
+import streamlit as st
+import numpy as np
 import pandas as pd
 
+# ---> DEVE ESSERE IL PRIMISSIMO COMANDO STREAMLIT <---
+st.set_page_config(
+    page_title="ASTRA-Q SSA",
+    page_icon="🛰️",
+    layout="wide",
+)
+
+# Da qui in poi puoi mettere tutto il resto del codice, titoli, widget, ecc.
+st.markdown('<div class="hero-title">🛰️ ASTRA-Q SSA</div>', unsafe_allow_html=True)
 def load_orbital_data():
     url = "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=json"
     local_fallback_path = "data/stations_fallback.json"
