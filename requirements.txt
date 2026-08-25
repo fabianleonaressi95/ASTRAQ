@@ -5,3 +5,4 @@ sgp4>=2.24
 scipy>=1.11
 matplotlib>=3.8
 requests>=2.31
+plotly>=5.0.0
